@@ -794,7 +794,7 @@ impl MarkdownConverter {
                 }
             }
 
-            let schema = field_cache
+            let _schema = field_cache
                 .as_ref()
                 .map(|fc| fc.get_field_schema(key))
                 .unwrap_or(Value::Null);

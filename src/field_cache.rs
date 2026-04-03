@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use log::{info, warn};
+use log::warn;
 use serde_json::Value;
 
 const CACHE_TTL_SECONDS: u64 = 86400; // 24 hours

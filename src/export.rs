@@ -3,10 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use log::{info, warn};
-use serde_json::Value;
-
 use crate::attachment::AttachmentHandler;
-use crate::config::{ConfigManager, FieldFilter};
+use crate::config::ConfigManager;
 use crate::error::Result;
 use crate::field_cache::FieldMetadataCache;
 use crate::jira_client::JiraApiClient;

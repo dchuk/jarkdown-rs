@@ -1,7 +1,7 @@
 //! Bulk export engine for exporting multiple Jira issues concurrently.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use chrono::Utc;
 use futures::stream::{self, StreamExt};
@@ -9,7 +9,7 @@ use serde_json::Value;
 use tokio::sync::Semaphore;
 use std::sync::Arc;
 
-use crate::error::{JarkdownError, Result};
+use crate::error::Result;
 use crate::export::perform_export;
 use crate::jira_client::JiraApiClient;
 

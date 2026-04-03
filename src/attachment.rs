@@ -1,6 +1,5 @@
 //! Handler for downloading and managing Jira attachments.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use log::{error, info};

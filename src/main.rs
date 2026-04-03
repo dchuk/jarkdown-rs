@@ -1,7 +1,7 @@
 //! Jarkdown CLI entry point.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process;
 
 use clap::Parser;
@@ -9,7 +9,6 @@ use log::info;
 
 use jarkdown::bulk::BulkExporter;
 use jarkdown::cli::{self, Cli, Command};
-use jarkdown::error::JarkdownError;
 use jarkdown::export::perform_export;
 use jarkdown::jira_client::JiraApiClient;
 
