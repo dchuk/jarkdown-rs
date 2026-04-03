@@ -1,0 +1,74 @@
+[package]
+name = "jarkdown"
+version = "0.2.0"
+edition = "2021"
+description = "Export Jira Cloud issues to Markdown with attachments"
+license = "MIT"
+keywords = ["jira", "markdown", "export", "documentation", "atlassian"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+
+[[bin]]
+name = "jarkdown"
+path = "src/main.rs"
+
+[lib]
+name = "jarkdown"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# HTML to Markdown
+html2md = "0.2"
+
+# Environment & config
+dotenvy = "0.15"
+toml = "0.8"
+
+# Filesystem / platform dirs
+dirs = "6"
+
+# URL encoding
+urlencoding = "2"
+
+# Regex
+regex = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Password input (for setup wizard)
+rpassword = "7"
+
+# Backoff/retry
+rand = "0.8"
+
+# Bytes (re-exported by reqwest but needed explicitly)
+bytes = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
