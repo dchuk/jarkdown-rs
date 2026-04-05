@@ -1,6 +1,6 @@
 [package]
 name = "jarkdown"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "Export Jira Cloud issues to Markdown with attachments"
 license = "MIT"

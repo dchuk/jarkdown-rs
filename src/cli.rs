@@ -66,6 +66,30 @@ pub struct SharedArgs {
     /// Save the raw Jira API JSON response alongside the Markdown file
     #[arg(long)]
     pub include_json: bool,
+
+    /// Maximum concurrent attachment downloads (default: 4)
+    #[arg(long, default_value = "4")]
+    pub attachment_concurrency: usize,
+
+    /// Only re-export issues that have changed since last export
+    #[arg(long)]
+    pub incremental: bool,
+
+    /// Force re-export even if issue is unchanged (overrides --incremental)
+    #[arg(long)]
+    pub force: bool,
+
+    /// Recursively export child issues (subtasks, epic children, linked issues)
+    #[arg(long)]
+    pub hierarchy: bool,
+
+    /// Maximum depth to recurse into child issues (requires --hierarchy)
+    #[arg(long, default_value = "2")]
+    pub max_depth: u32,
+
+    /// Maximum total issues to export in hierarchy mode (safety cap, requires --hierarchy)
+    #[arg(long, default_value = "200")]
+    pub max_issues: u32,
 }
 
 #[derive(Parser, Debug)]

@@ -9,9 +9,12 @@ use serde_json::Value;
 use tokio::sync::Semaphore;
 use std::sync::Arc;
 
+use log::info;
+
 use crate::error::Result;
 use crate::export::perform_export;
 use crate::jira_client::JiraApiClient;
+use crate::manifest::Manifest;
 
 /// Result of a single issue export attempt.
 #[derive(Debug, Clone)]
@@ -31,9 +34,13 @@ pub struct BulkExporter {
     include_fields: Option<String>,
     exclude_fields: Option<String>,
     include_json: bool,
+    attachment_concurrency: usize,
+    incremental: bool,
+    force: bool,
 }
 
 impl BulkExporter {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         api_client: JiraApiClient,
         concurrency: usize,
@@ -43,6 +50,9 @@ impl BulkExporter {
         include_fields: Option<&str>,
         exclude_fields: Option<&str>,
         include_json: bool,
+        attachment_concurrency: usize,
+        incremental: bool,
+        force: bool,
     ) -> Self {
         let mut dir = output_dir
             .map(PathBuf::from)
@@ -59,6 +69,9 @@ impl BulkExporter {
             include_fields: include_fields.map(|s| s.to_string()),
             exclude_fields: exclude_fields.map(|s| s.to_string()),
             include_json,
+            attachment_concurrency,
+            incremental,
+            force,
         }
     }
 
@@ -69,6 +82,13 @@ impl BulkExporter {
     ) -> (Vec<ExportResult>, Vec<ExportResult>) {
         let total = issue_keys.len();
 
+        // Load manifest for incremental support
+        let manifest = if self.incremental {
+            Some(Manifest::load(&self.output_dir))
+        } else {
+            None
+        };
+
         let results: Vec<ExportResult> = stream::iter(issue_keys.iter().enumerate())
             .map(|(i, key)| {
                 let sem = self.semaphore.clone();
@@ -78,11 +98,35 @@ impl BulkExporter {
                 let inc = self.include_fields.clone();
                 let exc = self.exclude_fields.clone();
                 let json = self.include_json;
+                let att_concurrency = self.attachment_concurrency;
                 let key = key.clone();
+                let manifest_ref = manifest.clone();
+                let force = self.force;
 
                 async move {
                     let _permit = sem.acquire().await.unwrap();
                     eprint!("\rExporting {}/{}... ({})", i + 1, total, key);
+
+                    // Incremental check: fetch issue metadata to compare timestamps
+                    if let Some(ref m) = manifest_ref {
+                        if !force {
+                            if let Ok(issue_data) = client.fetch_issue(&key).await {
+                                let updated = issue_data["fields"]["updated"]
+                                    .as_str()
+                                    .unwrap_or("");
+                                if !m.is_stale(&key, updated) {
+                                    info!("Skipping {} (unchanged)", key);
+                                    let path = output_dir.join(&key);
+                                    return ExportResult {
+                                        issue_key: key,
+                                        success: true,
+                                        output_path: Some(path),
+                                        error: None,
+                                    };
+                                }
+                            }
+                        }
+                    }
 
                     let output_path = output_dir.join(&key);
                     match perform_export(
@@ -93,6 +137,7 @@ impl BulkExporter {
                         inc.as_deref(),
                         exc.as_deref(),
                         json,
+                        att_concurrency,
                     )
                     .await
                     {
@@ -116,6 +161,21 @@ impl BulkExporter {
             .await;
 
         eprintln!(); // newline after progress
+
+        // Update manifest with successful exports
+        if self.incremental {
+            let mut manifest = manifest.unwrap_or_default();
+            for r in &results {
+                if r.success {
+                    // We record the current time as a proxy; the actual `updated`
+                    // field will be compared on the next run.
+                    manifest.record(&r.issue_key, &Utc::now().to_rfc3339());
+                }
+            }
+            if let Err(e) = manifest.save(&self.output_dir) {
+                eprintln!("Warning: Failed to save manifest: {}", e);
+            }
+        }
 
         let mut successes = Vec::new();
         let mut failures = Vec::new();

@@ -1,6 +1,9 @@
+[![Crates.io](https://img.shields.io/crates/v/jarkdown.svg)](https://crates.io/crates/jarkdown)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 # Jarkdown (Rust)
 
-A Rust port of [jarkdown](https://github.com/dchuk/jarkdown) — export Jira Cloud issues to Markdown with attachments.
+A fast, full-featured Rust CLI and library for exporting Jira Cloud issues to Markdown with attachments. Rust port of [jarkdown](https://github.com/dchuk/jarkdown).
 
 This crate provides both a **CLI tool** and an **importable library** for use in other Rust projects.
 
@@ -102,8 +105,120 @@ jarkdown export PROJ-123 --include-json
 jarkdown export PROJ-123 --include-fields "Story Points,Sprint"
 jarkdown export PROJ-123 --exclude-fields "Internal Notes"
 
+# Parallel attachment downloads
+jarkdown export PROJ-123 --attachment-concurrency 8
+
+# Incremental export (skip unchanged issues)
+jarkdown bulk PROJ-1 PROJ-2 PROJ-3 --incremental
+jarkdown bulk PROJ-1 PROJ-2 PROJ-3 --incremental --force  # override skip
+
+# Hierarchical export (epic + children, works with any command)
+jarkdown export EPIC-123 --hierarchy
+jarkdown export EPIC-123 --hierarchy --max-depth 3 --max-issues 500
+jarkdown bulk EPIC-1 EPIC-2 --hierarchy
+jarkdown query 'type = Epic AND project = FOO' --hierarchy
+
 # Verbose logging
 jarkdown export PROJ-123 --verbose
+```
+
+## CLI Defaults Reference
+
+| Flag | Applies To | Default |
+|------|-----------|---------|
+| `--output` | all | current directory |
+| `--verbose` | all | off |
+| `--refresh-fields` | all | off |
+| `--include-fields` | all | none (all fields) |
+| `--exclude-fields` | all | none |
+| `--include-json` | all | off |
+| `--concurrency` | bulk, query | 3 |
+| `--max-results` | query | 50 |
+| `--batch-name` | bulk, query | none |
+| `--attachment-concurrency` | all | 4 |
+| `--incremental` | all | off |
+| `--force` | all | off |
+| `--hierarchy` | all | off |
+| `--max-depth` | all (with `--hierarchy`) | 2 |
+| `--max-issues` | all (with `--hierarchy`) | 200 |
+
+## Output Structure
+
+### Single Issue
+
+```
+PROJ-123/
+├── PROJ-123.md
+├── screenshot.png
+└── design-doc.pdf
+```
+
+### With `--include-json`
+
+```
+PROJ-123/
+├── PROJ-123.md
+├── PROJ-123.json
+├── screenshot.png
+└── design-doc.pdf
+```
+
+### Bulk / Query Export
+
+```
+output/
+├── index.md
+├── PROJ-1/
+│   ├── PROJ-1.md
+│   └── attachment.png
+├── PROJ-2/
+│   └── PROJ-2.md
+└── PROJ-3/
+    ├── PROJ-3.md
+    └── spec.pdf
+```
+
+## Markdown Format
+
+Each exported issue produces a Markdown file with YAML frontmatter:
+
+```markdown
+---
+key: PROJ-123
+summary: Implement user authentication
+status: In Progress
+type: Story
+priority: High
+assignee: Jane Smith
+created: 2024-01-15
+updated: 2024-01-20
+---
+
+# PROJ-123: Implement user authentication
+
+**Status:** In Progress | **Type:** Story | **Priority:** High
+
+## Description
+
+The rendered description content goes here...
+
+## Comments
+
+### Jane Smith — 2024-01-16
+
+Comment content here...
+
+## Attachments
+
+- [screenshot.png](screenshot.png) (245.3 KB)
+- [design-doc.pdf](design-doc.pdf) (1.2 MB)
+
+## Custom Fields
+
+| Field | Value |
+|-------|-------|
+| Story Points | 5 |
+| Sprint | Sprint 23 |
 ```
 
 ## Configuration
@@ -175,6 +290,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,   // include_fields
         None,   // exclude_fields
         false,  // include_json
+        4,      // attachment_concurrency
+        false,  // incremental
+        false,  // force
     );
 
     let keys = vec!["PROJ-1".into(), "PROJ-2".into(), "PROJ-3".into()];
@@ -184,6 +302,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+## Requirements
+
+- **Rust 2021 edition** (for building from source)
+- **Jira Cloud** instance (Server/Data Center not supported)
+- **Jira API token** — [create one here](https://id.atlassian.com/manage-profile/security/api-tokens)
+
+## Limitations
+
+- **Jira Cloud only** — Server and Data Center instances are not supported
+- Attachment downloads are sequential by default (use `--attachment-concurrency` to parallelize)
+- No webhook/real-time sync — exports are point-in-time snapshots
+
+## Roadmap
+
+- [x] Parallel attachment downloads (`--attachment-concurrency`)
+- [x] Incremental/delta export (`--incremental`)
+- [ ] Alternative output formats (PDF, HTML, Confluence wiki)
+- [x] Hierarchical export — epics with child issues (`--hierarchy` flag)
+
+## Contributing
+
+```bash
+git clone https://github.com/dchuk/jarkdown-rs.git
+cd jarkdown-rs
+cargo build
+cargo test
+cargo clippy -- -D warnings
+```
+
+PRs welcome! Please ensure `cargo clippy` and `cargo test` pass before submitting.
 
 ## License
 

@@ -113,6 +113,21 @@ impl FieldMetadataCache {
             .unwrap_or_else(|| field_id.to_string())
     }
 
+    /// Reverse-lookup: find a field ID by its display name (e.g., "Epic Link").
+    pub fn get_field_id_by_name(&mut self, name: &str) -> Option<String> {
+        if self.field_map.is_none() {
+            // Populate the map so we can iterate it
+            self.get_field_name("");
+        }
+        self.field_map
+            .as_ref()
+            .and_then(|map| {
+                map.iter()
+                    .find(|(_, v)| v.as_str() == name)
+                    .map(|(k, _)| k.clone())
+            })
+    }
+
     /// Get the schema for a field by ID.
     pub fn get_field_schema(&self, field_id: &str) -> Value {
         let fields = self.load();

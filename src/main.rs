@@ -10,7 +10,9 @@ use log::info;
 use jarkdown::bulk::BulkExporter;
 use jarkdown::cli::{self, Cli, Command};
 use jarkdown::export::perform_export;
+use jarkdown::hierarchy::{HierarchyExporter, HierarchyOptions};
 use jarkdown::jira_client::JiraApiClient;
+use jarkdown::manifest::Manifest;
 
 /// Load and validate Jira credentials from environment variables.
 fn load_credentials() -> (String, String, String) {
@@ -204,6 +206,18 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
         }
     };
 
+    // Hierarchy mode: delegate to hierarchy exporter
+    if args.shared.hierarchy {
+        let output_dir = args
+            .shared
+            .output
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        run_hierarchy_export(&client, &args.issue_key, &output_dir, &args.shared).await;
+        return;
+    }
+
     let output_path = args
         .shared
         .output
@@ -215,6 +229,19 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
                 .join(&args.issue_key)
         });
 
+    // Incremental check for single export
+    if args.shared.incremental && !args.shared.force {
+        let parent_dir = output_path.parent().unwrap_or(std::path::Path::new("."));
+        let manifest = Manifest::load(parent_dir);
+        if let Ok(issue_data) = client.fetch_issue(&args.issue_key).await {
+            let updated = issue_data["fields"]["updated"].as_str().unwrap_or("");
+            if !manifest.is_stale(&args.issue_key, updated) {
+                info!("Skipping {} (unchanged since last export)", args.issue_key);
+                return;
+            }
+        }
+    }
+
     match perform_export(
         &client,
         &args.issue_key,
@@ -223,10 +250,24 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
         args.shared.include_fields.as_deref(),
         args.shared.exclude_fields.as_deref(),
         args.shared.include_json,
+        args.shared.attachment_concurrency,
     )
     .await
     {
         Ok(path) => {
+            // Update manifest for incremental support
+            if args.shared.incremental {
+                let parent_dir = path.parent().unwrap_or(std::path::Path::new("."));
+                let mut manifest = Manifest::load(parent_dir);
+                if let Ok(issue_data) = client.fetch_issue(&args.issue_key).await {
+                    let updated = issue_data["fields"]["updated"].as_str().unwrap_or("");
+                    manifest.record(&args.issue_key, updated);
+                    if let Err(e) = manifest.save(parent_dir) {
+                        eprintln!("Warning: Failed to save manifest: {}", e);
+                    }
+                }
+            }
+
             info!("\nSuccessfully exported {} to {:?}", args.issue_key, path);
             if args.shared.include_json {
                 info!("  - Raw JSON: {:?}", path.join(format!("{}.json", args.issue_key)));
@@ -255,6 +296,20 @@ async fn handle_bulk(args: jarkdown::cli::BulkArgs) {
         }
     };
 
+    // Hierarchy mode: run hierarchy export for each issue key
+    if args.shared.hierarchy {
+        let output_dir = args
+            .shared
+            .output
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        for key in &args.issue_keys {
+            run_hierarchy_export(&client, key, &output_dir, &args.shared).await;
+        }
+        return;
+    }
+
     let exporter = BulkExporter::new(
         client,
         args.concurrency,
@@ -264,6 +319,9 @@ async fn handle_bulk(args: jarkdown::cli::BulkArgs) {
         args.shared.include_fields.as_deref(),
         args.shared.exclude_fields.as_deref(),
         args.shared.include_json,
+        args.shared.attachment_concurrency,
+        args.shared.incremental,
+        args.shared.force,
     );
 
     let (successes, failures) = exporter.export_bulk(&args.issue_keys).await;
@@ -309,6 +367,20 @@ async fn handle_query(args: jarkdown::cli::QueryArgs) {
         .collect();
     eprintln!("Found {} issues.", issue_keys.len());
 
+    // Hierarchy mode: run hierarchy export for each matched issue
+    if args.shared.hierarchy {
+        let output_dir = args
+            .shared
+            .output
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        for key in &issue_keys {
+            run_hierarchy_export(&client, key, &output_dir, &args.shared).await;
+        }
+        return;
+    }
+
     let exporter = BulkExporter::new(
         client,
         args.concurrency,
@@ -318,6 +390,9 @@ async fn handle_query(args: jarkdown::cli::QueryArgs) {
         None,
         None,
         args.shared.include_json,
+        args.shared.attachment_concurrency,
+        args.shared.incremental,
+        args.shared.force,
     );
 
     let (successes, failures) = exporter.export_bulk(&issue_keys).await;
@@ -339,6 +414,42 @@ async fn handle_query(args: jarkdown::cli::QueryArgs) {
     if !failures.is_empty() {
         process::exit(1);
     }
+}
+
+/// Run hierarchical export for a single issue key.
+async fn run_hierarchy_export(
+    client: &JiraApiClient,
+    issue_key: &str,
+    output_dir: &std::path::Path,
+    shared: &jarkdown::cli::SharedArgs,
+) {
+    let options = HierarchyOptions {
+        max_depth: shared.max_depth,
+        max_issues: shared.max_issues,
+        refresh_fields: shared.refresh_fields,
+        include_fields: shared.include_fields.clone(),
+        exclude_fields: shared.exclude_fields.clone(),
+        include_json: shared.include_json,
+        attachment_concurrency: shared.attachment_concurrency,
+    };
+
+    let mut exporter = HierarchyExporter::new(client, options);
+    match exporter.export_hierarchy(issue_key, output_dir).await {
+        Ok(tree) => {
+            eprintln!(
+                "Exported hierarchy for {} ({} issues)",
+                issue_key,
+                count_nodes(&tree)
+            );
+        }
+        Err(e) => {
+            eprintln!("Error exporting hierarchy for {}: {}", issue_key, e);
+        }
+    }
+}
+
+fn count_nodes(node: &jarkdown::IssueNode) -> usize {
+    1 + node.children.iter().map(count_nodes).sum::<usize>()
 }
 
 #[tokio::main]

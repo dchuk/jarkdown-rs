@@ -31,7 +31,9 @@ pub mod custom_field;
 pub mod error;
 pub mod export;
 pub mod field_cache;
+pub mod hierarchy;
 pub mod jira_client;
+pub mod manifest;
 pub mod markdown;
 pub mod retry;
 
@@ -42,19 +44,38 @@ pub use config::{ConfigManager, FieldFilter};
 pub use error::{JarkdownError, Result};
 pub use export::perform_export;
 pub use field_cache::FieldMetadataCache;
+pub use hierarchy::{HierarchyExporter, HierarchyOptions, IssueNode};
 pub use jira_client::JiraApiClient;
+pub use manifest::Manifest;
 pub use markdown::MarkdownConverter;
 pub use retry::RetryConfig;
 
 use std::path::{Path, PathBuf};
 
 /// Options for exporting a single issue.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ExportOptions {
     pub refresh_fields: bool,
     pub include_fields: Option<String>,
     pub exclude_fields: Option<String>,
     pub include_json: bool,
+    pub attachment_concurrency: usize,
+    pub incremental: bool,
+    pub force: bool,
+}
+
+impl Default for ExportOptions {
+    fn default() -> Self {
+        Self {
+            refresh_fields: false,
+            include_fields: None,
+            exclude_fields: None,
+            include_json: false,
+            attachment_concurrency: 4,
+            incremental: false,
+            force: false,
+        }
+    }
 }
 
 /// High-level convenience function to export a single Jira issue.
@@ -91,6 +112,7 @@ pub async fn export_issue(
         options.include_fields.as_deref(),
         options.exclude_fields.as_deref(),
         options.include_json,
+        options.attachment_concurrency,
     )
     .await
 }

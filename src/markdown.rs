@@ -507,28 +507,7 @@ impl MarkdownConverter {
 
     /// Extract plain text from ADF content, stripping all formatting.
     fn adf_to_plain_text(&self, adf: &Value) -> String {
-        if adf.is_null() {
-            return String::new();
-        }
-        if let Some(s) = adf.as_str() {
-            return s.to_string();
-        }
-        if !adf.is_object() {
-            return String::new();
-        }
-        if adf["type"].as_str() == Some("text") {
-            return adf["text"].as_str().unwrap_or("").to_string();
-        }
-        adf["content"]
-            .as_array()
-            .map(|c| {
-                c.iter()
-                    .map(|n| self.adf_to_plain_text(n))
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .unwrap_or_default()
+        adf_to_plain_text_recursive(adf)
     }
 
     /// Generate metadata dictionary from Jira issue data.
@@ -707,6 +686,35 @@ impl MarkdownConverter {
             }
             _ => lines.push("None".into()),
         }
+        lines.push(String::new());
+        lines
+    }
+
+    fn compose_child_issues_section(&self, child_issues: &[Value]) -> Vec<String> {
+        let mut lines = vec!["## Child Issues".into(), String::new()];
+
+        lines.push(format!("{} child issue(s)", child_issues.len()));
+        lines.push(String::new());
+
+        // Table
+        lines.push("| Key | Type | Summary | Status | Assignee |".into());
+        lines.push("|-----|------|---------|--------|----------|".into());
+
+        for issue in child_issues {
+            let key = issue["key"].as_str().unwrap_or("UNKNOWN");
+            let summary = issue["fields"]["summary"].as_str().unwrap_or("");
+            let status = issue["fields"]["status"]["name"].as_str().unwrap_or("");
+            let issue_type = issue["fields"]["issuetype"]["name"].as_str().unwrap_or("");
+            let assignee = issue["fields"]["assignee"]["displayName"]
+                .as_str()
+                .unwrap_or("Unassigned");
+
+            lines.push(format!(
+                "| [{}]({}/browse/{}) | {} | {} | {} | {} |",
+                key, self.base_url, key, issue_type, summary, status, assignee
+            ));
+        }
+
         lines.push(String::new());
         lines
     }
@@ -912,6 +920,7 @@ impl MarkdownConverter {
         downloaded: &[DownloadedAttachment],
         field_cache: &mut Option<FieldMetadataCache>,
         field_filter: &Option<FieldFilter>,
+        child_issues: &[Value],
     ) -> String {
         self.prepare_attachment_lookup(downloaded);
 
@@ -964,6 +973,9 @@ impl MarkdownConverter {
         lines.extend(self.compose_environment_section(issue_data));
         lines.extend(self.compose_linked_issues_section(issue_data));
         lines.extend(self.compose_subtasks_section(issue_data));
+        if !child_issues.is_empty() {
+            lines.extend(self.compose_child_issues_section(child_issues));
+        }
         lines.extend(self.compose_worklogs_section(issue_data));
 
         let custom_lines = self.compose_custom_fields_section(issue_data, field_cache, field_filter);
@@ -996,6 +1008,31 @@ impl MarkdownConverter {
 }
 
 /// Title-case a string (matching Python's str.title()).
+fn adf_to_plain_text_recursive(adf: &Value) -> String {
+    if adf.is_null() {
+        return String::new();
+    }
+    if let Some(s) = adf.as_str() {
+        return s.to_string();
+    }
+    if !adf.is_object() {
+        return String::new();
+    }
+    if adf["type"].as_str() == Some("text") {
+        return adf["text"].as_str().unwrap_or("").to_string();
+    }
+    adf["content"]
+        .as_array()
+        .map(|c| {
+            c.iter()
+                .map(adf_to_plain_text_recursive)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default()
+}
+
 fn capitalize(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut capitalize_next = true;

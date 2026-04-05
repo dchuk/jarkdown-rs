@@ -14,6 +14,7 @@ use crate::markdown::MarkdownConverter;
 ///
 /// Fetches issue data, downloads attachments, builds field metadata and
 /// config, converts to Markdown, and writes output files.
+#[allow(clippy::too_many_arguments)]
 pub async fn perform_export(
     api_client: &JiraApiClient,
     issue_key: &str,
@@ -22,6 +23,7 @@ pub async fn perform_export(
     include_fields: Option<&str>,
     exclude_fields: Option<&str>,
     include_json: bool,
+    attachment_concurrency: usize,
 ) -> Result<PathBuf> {
     // Ensure output directory exists
     tokio::fs::create_dir_all(output_path).await?;
@@ -35,7 +37,7 @@ pub async fn perform_export(
         .as_array()
         .cloned()
         .unwrap_or_default();
-    let downloaded = handler.download_all_attachments(&attachments, output_path).await;
+    let downloaded = handler.download_all_attachments(&attachments, output_path, attachment_concurrency).await;
 
     // Build field metadata cache
     let mut field_cache = FieldMetadataCache::new(&api_client.domain);
@@ -55,6 +57,31 @@ pub async fn perform_export(
     let config_manager = ConfigManager::new(None);
     let field_filter = config_manager.get_field_filter(include_fields, exclude_fields);
 
+    // Discover child issues for Epics
+    let child_issues = {
+        let issue_type = issue_data["fields"]["issuetype"]["name"]
+            .as_str()
+            .unwrap_or("");
+        if issue_type == "Epic" {
+            // Look up the "Epic Link" field ID for JQL, and also query by parent
+            let epic_link_field = field_cache.get_field_id_by_name("Epic Link");
+            let mut clauses = vec![format!("parent = {}", issue_key)];
+            if let Some(ref field_id) = epic_link_field {
+                clauses.push(format!("\"{}\" = {}", field_id, issue_key));
+            }
+            let jql = clauses.join(" OR ");
+            match api_client.search_jql(&jql, 200).await {
+                Ok(issues) => issues,
+                Err(e) => {
+                    warn!("Failed to fetch child issues for epic: {}", e);
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        }
+    };
+
     // Convert to Markdown
     let mut converter = MarkdownConverter::new(&api_client.base_url, &api_client.domain);
     let mut cache_opt = Some(field_cache);
@@ -64,6 +91,7 @@ pub async fn perform_export(
         &downloaded,
         &mut cache_opt,
         &filter_opt,
+        &child_issues,
     );
 
     // Write raw JSON (opt-in)

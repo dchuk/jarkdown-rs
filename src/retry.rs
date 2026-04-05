@@ -31,12 +31,12 @@ impl Default for RetryConfig {
 pub fn parse_retry_after(header_value: &str) -> f64 {
     let trimmed = header_value.trim();
     if let Ok(seconds) = trimmed.parse::<f64>() {
-        return seconds.max(0.0).min(300.0);
+        return seconds.clamp(0.0, 300.0);
     }
     if let Ok(retry_time) = chrono::DateTime::parse_from_rfc2822(trimmed) {
         let now = Utc::now();
         let wait = (retry_time.with_timezone(&Utc) - now).num_milliseconds() as f64 / 1000.0;
-        return wait.max(0.0).min(300.0);
+        return wait.clamp(0.0, 300.0);
     }
     5.0
 }
@@ -57,7 +57,7 @@ where
         match f().await {
             Ok(val) => return Ok(val),
             Err(e) => {
-                let is_retryable = e.status().map_or(false, |s| {
+                let is_retryable = e.status().is_some_and(|s| {
                     config.retryable_status_codes.contains(&s.as_u16())
                 });
                 if !is_retryable || attempt == config.max_retries {

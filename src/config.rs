@@ -80,15 +80,13 @@ impl ConfigManager {
                     .filter(|s| !s.is_empty())
                     .collect(),
             )
-        } else if let Some(inc_arr) = fields_config.get("include").and_then(|v| v.as_array()) {
-            Some(
+        } else {
+            fields_config.get("include").and_then(|v| v.as_array()).map(|inc_arr| {
                 inc_arr
                     .iter()
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect(),
-            )
-        } else {
-            None
+                    .collect()
+            })
         };
 
         // Determine exclude list
