@@ -4,16 +4,16 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "jarkdown",
+    name = "jarkdown-rs",
     about = "Export Jira issues to Markdown with attachments",
     version,
     after_help = r#"Examples:
-  jarkdown export PROJ-123
-  jarkdown PROJ-123                              # backward-compat form
-  jarkdown export PROJ-123 --output ~/Documents/jira-exports
-  jarkdown bulk PROJ-1 PROJ-2 PROJ-3
-  jarkdown query 'project = FOO AND status = Done'
-  jarkdown setup
+  jarkdown-rs export PROJ-123
+  jarkdown-rs PROJ-123                              # backward-compat form
+  jarkdown-rs export PROJ-123 --output ~/Documents/jira-exports
+  jarkdown-rs bulk PROJ-1 PROJ-2 PROJ-3
+  jarkdown-rs query 'project = FOO AND status = Done'
+  jarkdown-rs setup
 
 Environment variables:
   JIRA_DOMAIN     - Your Jira domain (e.g., your-company.atlassian.net)

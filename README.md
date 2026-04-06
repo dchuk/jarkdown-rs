@@ -5,20 +5,22 @@
 
 A fast, full-featured Rust CLI and library for exporting Jira Cloud issues to Markdown with attachments. Rust port of [jarkdown](https://github.com/dchuk/jarkdown).
 
-This crate provides both a **CLI tool** and an **importable library** for use in other Rust projects.
+This crate provides both a **CLI tool** (`jarkdown-rs`) and an **importable library** for use in other Rust projects.
+
+> **Note:** The CLI binary is named `jarkdown-rs` to avoid conflicts with the Python [jarkdown](https://github.com/dchuk/jarkdown) package.
 
 ## Installation
 
 ### Homebrew (macOS)
 
 ```bash
-brew install dchuk/tap/jarkdown
+brew install dchuk/tap/jarkdown-rs
 ```
 
 ### Shell installer (macOS / Linux)
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dchuk/jarkdown-rs/releases/latest/download/jarkdown-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dchuk/jarkdown-rs/releases/latest/download/jarkdown-rs-installer.sh | sh
 ```
 
 ### Prebuilt binaries
@@ -27,11 +29,11 @@ Download the latest binary for your platform from the [releases page](https://gi
 
 | Platform | Archive |
 |----------|---------|
-| macOS (Apple Silicon) | `jarkdown-aarch64-apple-darwin.tar.xz` |
-| macOS (Intel) | `jarkdown-x86_64-apple-darwin.tar.xz` |
-| Linux (x86_64) | `jarkdown-x86_64-unknown-linux-gnu.tar.xz` |
-| Linux (ARM64) | `jarkdown-aarch64-unknown-linux-gnu.tar.xz` |
-| Windows (x86_64) | `jarkdown-x86_64-pc-windows-msvc.zip` |
+| macOS (Apple Silicon) | `jarkdown-rs-aarch64-apple-darwin.tar.xz` |
+| macOS (Intel) | `jarkdown-rs-x86_64-apple-darwin.tar.xz` |
+| Linux (x86_64) | `jarkdown-rs-x86_64-unknown-linux-gnu.tar.xz` |
+| Linux (ARM64) | `jarkdown-rs-aarch64-unknown-linux-gnu.tar.xz` |
+| Windows (x86_64) | `jarkdown-rs-x86_64-pc-windows-msvc.zip` |
 
 ### From crates.io
 
@@ -65,14 +67,14 @@ Jarkdown needs three pieces of information to connect to your Jira instance:
 ### Interactive setup
 
 ```bash
-jarkdown setup
+jarkdown-rs setup
 ```
 
 This walks you through creating a `.env` file in the current directory.
 
 ### Manual setup
 
-Create a `.env` file in the directory you'll run `jarkdown` from:
+Create a `.env` file in the directory you'll run `jarkdown-rs` from:
 
 ```
 JIRA_DOMAIN=your-company.atlassian.net
@@ -86,40 +88,40 @@ Alternatively, set these as environment variables directly (e.g. in your shell p
 
 ```bash
 # Export a single issue
-jarkdown export PROJ-123
-jarkdown PROJ-123                              # backward-compat shorthand
+jarkdown-rs export PROJ-123
+jarkdown-rs PROJ-123                              # backward-compat shorthand
 
 # Export to a specific directory
-jarkdown export PROJ-123 --output ~/exports
+jarkdown-rs export PROJ-123 --output ~/exports
 
 # Bulk export
-jarkdown bulk PROJ-1 PROJ-2 PROJ-3 --concurrency 5
+jarkdown-rs bulk PROJ-1 PROJ-2 PROJ-3 --concurrency 5
 
 # JQL query export
-jarkdown query 'project = FOO AND status = Done' --limit 100
+jarkdown-rs query 'project = FOO AND status = Done' --limit 100
 
 # Include raw JSON alongside Markdown
-jarkdown export PROJ-123 --include-json
+jarkdown-rs export PROJ-123 --include-json
 
 # Field filtering
-jarkdown export PROJ-123 --include-fields "Story Points,Sprint"
-jarkdown export PROJ-123 --exclude-fields "Internal Notes"
+jarkdown-rs export PROJ-123 --include-fields "Story Points,Sprint"
+jarkdown-rs export PROJ-123 --exclude-fields "Internal Notes"
 
 # Parallel attachment downloads
-jarkdown export PROJ-123 --attachment-concurrency 8
+jarkdown-rs export PROJ-123 --attachment-concurrency 8
 
 # Incremental export (skip unchanged issues)
-jarkdown bulk PROJ-1 PROJ-2 PROJ-3 --incremental
-jarkdown bulk PROJ-1 PROJ-2 PROJ-3 --incremental --force  # override skip
+jarkdown-rs bulk PROJ-1 PROJ-2 PROJ-3 --incremental
+jarkdown-rs bulk PROJ-1 PROJ-2 PROJ-3 --incremental --force  # override skip
 
 # Hierarchical export (epic + children, works with any command)
-jarkdown export EPIC-123 --hierarchy
-jarkdown export EPIC-123 --hierarchy --max-depth 3 --max-issues 500
-jarkdown bulk EPIC-1 EPIC-2 --hierarchy
-jarkdown query 'type = Epic AND project = FOO' --hierarchy
+jarkdown-rs export EPIC-123 --hierarchy
+jarkdown-rs export EPIC-123 --hierarchy --max-depth 3 --max-issues 500
+jarkdown-rs bulk EPIC-1 EPIC-2 --hierarchy
+jarkdown-rs query 'type = Epic AND project = FOO' --hierarchy
 
 # Verbose logging
-jarkdown export PROJ-123 --verbose
+jarkdown-rs export PROJ-123 --verbose
 ```
 
 ## CLI Defaults Reference

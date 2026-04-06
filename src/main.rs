@@ -30,7 +30,7 @@ fn load_credentials() -> (String, String, String) {
     if !env_path.exists() && (domain.is_none() || email.is_none() || api_token.is_none()) {
         eprintln!("Error: Configuration file '.env' not found.");
         eprintln!();
-        eprintln!("To set up your configuration, run: jarkdown setup");
+        eprintln!("To set up your configuration, run: jarkdown-rs setup");
         eprintln!("Or create a .env file manually with:");
         eprintln!("  JIRA_DOMAIN=your-company.atlassian.net");
         eprintln!("  JIRA_EMAIL=your-email@example.com");
@@ -55,7 +55,7 @@ fn load_credentials() -> (String, String, String) {
             missing.join(", ")
         );
         eprintln!();
-        eprintln!("To set up your configuration, run: jarkdown setup");
+        eprintln!("To set up your configuration, run: jarkdown-rs setup");
         eprintln!("Or add the missing variables to your .env file.");
         process::exit(1);
     }
@@ -153,7 +153,7 @@ fn setup_configuration() {
         Ok(_) => {
             println!();
             println!("Configuration saved to {:?}", env_path);
-            println!("You can now run: jarkdown export ISSUE-KEY");
+            println!("You can now run: jarkdown-rs export ISSUE-KEY");
         }
         Err(e) => {
             eprintln!("Error writing .env file: {}", e);
