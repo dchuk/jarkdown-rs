@@ -79,7 +79,7 @@ pub struct SharedArgs {
     #[arg(long)]
     pub force: bool,
 
-    /// Recursively export child issues (subtasks, epic children, linked issues)
+    /// Recursively export child issues (subtasks, epic children, JPD delivery items, linked issues)
     #[arg(long)]
     pub hierarchy: bool,
 

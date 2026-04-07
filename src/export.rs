@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use log::{info, warn};
+use serde_json::Value;
 use crate::attachment::AttachmentHandler;
 use crate::config::ConfigManager;
 use crate::error::Result;
@@ -57,7 +58,7 @@ pub async fn perform_export(
     let config_manager = ConfigManager::new(None);
     let field_filter = config_manager.get_field_filter(include_fields, exclude_fields);
 
-    // Discover child issues for Epics
+    // Discover child issues for Epics (via JQL) and Ideas (via issue links)
     let child_issues = {
         let issue_type = issue_data["fields"]["issuetype"]["name"]
             .as_str()
@@ -78,7 +79,7 @@ pub async fn perform_export(
                 }
             }
         } else {
-            Vec::new()
+            extract_delivery_children(&issue_data)
         }
     };
 
@@ -106,4 +107,31 @@ pub async fn perform_export(
     tokio::fs::write(&md_file, markdown_content).await?;
 
     Ok(output_path.to_path_buf())
+}
+
+/// Extract child issues from "is implemented by" issue links (JPD Polaris links).
+///
+/// JPD Ideas link to delivery items (Epics, Stories, Tasks) via these links.
+/// The delivery item appears as an `inwardIssue` with `type.inward` = "is implemented by".
+fn extract_delivery_children(issue_data: &Value) -> Vec<Value> {
+    let links = match issue_data["fields"]["issuelinks"].as_array() {
+        Some(l) => l,
+        None => return Vec::new(),
+    };
+
+    links
+        .iter()
+        .filter(|link| {
+            let link_type = link["type"]["inward"].as_str().unwrap_or("");
+            link_type.to_lowercase().contains("is implemented by")
+        })
+        .filter_map(|link| {
+            let inward = &link["inwardIssue"];
+            if inward.is_null() {
+                None
+            } else {
+                Some(inward.clone())
+            }
+        })
+        .collect()
 }

@@ -114,11 +114,14 @@ jarkdown-rs export PROJ-123 --attachment-concurrency 8
 jarkdown-rs bulk PROJ-1 PROJ-2 PROJ-3 --incremental
 jarkdown-rs bulk PROJ-1 PROJ-2 PROJ-3 --incremental --force  # override skip
 
-# Hierarchical export (epic + children, works with any command)
+# Hierarchical export (epics, JPD ideas, and children — works with any command)
 jarkdown-rs export EPIC-123 --hierarchy
 jarkdown-rs export EPIC-123 --hierarchy --max-depth 3 --max-issues 500
 jarkdown-rs bulk EPIC-1 EPIC-2 --hierarchy
 jarkdown-rs query 'type = Epic AND project = FOO' --hierarchy
+
+# JPD Idea → delivery items (follows "is implemented by" links)
+jarkdown-rs export IDEA-42 --hierarchy --max-depth 3
 
 # Verbose logging
 jarkdown-rs export PROJ-123 --verbose
@@ -305,6 +308,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Jira Product Discovery (JPD) Support
+
+Jarkdown supports exporting JPD Idea tickets and their delivery hierarchy. JPD links Ideas to delivery items (Epics, Stories, Tasks) via "implements" / "is implemented by" Polaris links.
+
+```bash
+# Export an Idea and all its delivery items
+jarkdown-rs export IDEA-42 --hierarchy --max-depth 3
+
+# Single export shows delivery items in the Child Issues section
+jarkdown-rs export IDEA-42
+```
+
+In `--hierarchy` mode, jarkdown-rs follows the full chain: Idea → Epics → Stories/Tasks → Subtasks, producing a nested directory tree with an index.
+
 ## Requirements
 
 - **Rust 2021 edition** (for building from source)
@@ -322,7 +339,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - [x] Parallel attachment downloads (`--attachment-concurrency`)
 - [x] Incremental/delta export (`--incremental`)
 - [ ] Alternative output formats (PDF, HTML, Confluence wiki)
-- [x] Hierarchical export — epics with child issues (`--hierarchy` flag)
+- [x] Hierarchical export — epics and JPD ideas with child issues (`--hierarchy` flag)
 
 ## Contributing
 

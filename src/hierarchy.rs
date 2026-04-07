@@ -1,7 +1,8 @@
-//! Hierarchical export of epics and their child issues.
+//! Hierarchical export of epics, JPD ideas, and their child issues.
 //!
-//! Fetches a root issue, discovers children via JQL and issue links,
-//! and exports everything into a tree-structured directory.
+//! Fetches a root issue, discovers children via JQL, issue links, and
+//! JPD delivery links ("is implemented by"), and exports everything
+//! into a tree-structured directory.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -155,7 +156,7 @@ impl<'a> HierarchyExporter<'a> {
             }
         }
 
-        // 2. Issue links (outward: "is parent of", "contains", etc.)
+        // 2. Issue links (e.g. "is parent of", "contains", "is implemented by")
         if let Some(links) = fields["issuelinks"].as_array() {
             for link in links {
                 // Outward links where this issue is the parent
@@ -327,10 +328,12 @@ fn render_issue_list(node: &IssueNode, lines: &mut Vec<String>) {
 }
 
 /// Check if a link type name indicates a parent-child relationship.
+/// Includes JPD Polaris links ("is implemented by") for Idea → delivery item traversal.
 fn is_parent_link_type(link_type: &str) -> bool {
     let lower = link_type.to_lowercase();
     lower.contains("parent of")
         || lower.contains("contains")
         || lower.contains("is epic of")
         || lower.contains("is parent of")
+        || lower.contains("is implemented by")
 }
