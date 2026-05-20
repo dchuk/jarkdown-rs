@@ -36,6 +36,7 @@ pub struct HierarchyOptions {
     pub include_json: bool,
     pub attachment_concurrency: usize,
     pub no_attachments: bool,
+    pub include_changelog: bool,
 }
 
 /// Orchestrates discovery and export of an issue hierarchy.
@@ -123,6 +124,7 @@ impl<'a> HierarchyExporter<'a> {
                 include_json: self.options.include_json,
                 attachment_concurrency: self.options.attachment_concurrency,
                 no_attachments: self.options.no_attachments,
+                include_changelog: self.options.include_changelog,
             },
         )
         .await?;
@@ -367,6 +369,7 @@ mod tests {
             include_json: true,
             attachment_concurrency: 4,
             no_attachments: true,
+            include_changelog: false,
         };
 
         let mut exporter = HierarchyExporter::new(&client, options);

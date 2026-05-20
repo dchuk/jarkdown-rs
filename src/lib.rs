@@ -25,6 +25,7 @@
 
 pub mod attachment;
 pub mod bulk;
+pub mod changelog;
 pub mod cli;
 pub mod config;
 pub mod custom_field;
@@ -115,6 +116,7 @@ pub async fn export_issue(
             include_json: options.include_json,
             attachment_concurrency: options.attachment_concurrency,
             no_attachments: options.no_attachments,
+            include_changelog: false,
         },
     )
     .await

@@ -98,6 +98,11 @@ pub struct SharedArgs {
     /// Maximum total issues to export in hierarchy mode (safety cap, requires --hierarchy)
     #[arg(long, default_value = "200")]
     pub max_issues: u32,
+
+    /// Also export the full paginated changelog (audit trail of field changes)
+    /// to a sibling `{KEY}.changelog.md` file.
+    #[arg(long)]
+    pub include_changelog: bool,
 }
 
 #[derive(Parser, Debug)]

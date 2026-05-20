@@ -7,6 +7,7 @@ use serde_json::Value;
 use urlencoding::encode as url_encode;
 
 use crate::attachment::DownloadedAttachment;
+use crate::changelog::ChangelogSummary;
 use crate::config::FieldFilter;
 use crate::custom_field::CustomFieldRenderer;
 use crate::field_cache::FieldMetadataCache;
@@ -1080,6 +1081,7 @@ impl MarkdownConverter {
     }
 
     /// Compose the final markdown file content.
+    #[allow(clippy::too_many_arguments)]
     pub fn compose_markdown(
         &mut self,
         issue_data: &Value,
@@ -1088,6 +1090,7 @@ impl MarkdownConverter {
         field_cache: &mut Option<FieldMetadataCache>,
         field_filter: &Option<FieldFilter>,
         child_issues: &[Value],
+        changelog_summary: Option<&ChangelogSummary>,
     ) -> String {
         self.prepare_attachment_lookup(downloaded);
         self.prepare_skipped_attachment_lookup(skipped_attachments);
@@ -1104,6 +1107,9 @@ impl MarkdownConverter {
         let yaml_str = serde_yaml::to_string(&metadata).unwrap_or_default();
         lines.push("---".into());
         lines.push(yaml_str.trim_end().to_string());
+        if let Some(cl) = changelog_summary {
+            lines.push(format!("changelog: {}", cl.file_name));
+        }
         lines.push("---".into());
         lines.push(String::new());
 
@@ -1160,6 +1166,17 @@ impl MarkdownConverter {
         let comment_lines = self.compose_comments_section(issue_data, downloaded);
         if !comment_lines.is_empty() {
             lines.extend(comment_lines);
+        }
+
+        if let Some(cl) = changelog_summary {
+            let plural = if cl.entry_count == 1 { "entry" } else { "entries" };
+            lines.push("## Changelog".into());
+            lines.push(String::new());
+            lines.push(format!(
+                "See [{}]({}) ({} {}).",
+                cl.file_name, cl.file_name, cl.entry_count, plural
+            ));
+            lines.push(String::new());
         }
 
         // Attachments
@@ -1358,7 +1375,7 @@ mod tests {
             MarkdownConverter::new("https://example.atlassian.net", "example.atlassian.net");
 
         let markdown =
-            converter.compose_markdown(&issue_data, &[], &skipped, &mut None, &None, &[]);
+            converter.compose_markdown(&issue_data, &[], &skipped, &mut None, &None, &[], None);
 
         assert!(markdown.contains("## Attachments"));
         assert!(markdown.contains(

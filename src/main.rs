@@ -255,6 +255,7 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
             include_json: args.shared.include_json,
             attachment_concurrency: args.shared.attachment_concurrency,
             no_attachments: args.shared.no_attachments,
+            include_changelog: args.shared.include_changelog,
         },
     );
 
@@ -355,7 +356,8 @@ async fn handle_bulk(args: jarkdown::cli::BulkArgs) {
         args.shared.force,
     )
     .with_no_attachments(args.shared.no_attachments)
-    .with_issue_timeout_seconds(args.shared.issue_timeout_seconds);
+    .with_issue_timeout_seconds(args.shared.issue_timeout_seconds)
+    .with_include_changelog(args.shared.include_changelog);
 
     let (successes, failures) = exporter.export_bulk(&args.issue_keys).await;
     let all_results: Vec<_> = successes.iter().chain(failures.iter()).cloned().collect();
@@ -444,7 +446,8 @@ async fn handle_query(args: jarkdown::cli::QueryArgs) {
         args.shared.force,
     )
     .with_no_attachments(args.shared.no_attachments)
-    .with_issue_timeout_seconds(args.shared.issue_timeout_seconds);
+    .with_issue_timeout_seconds(args.shared.issue_timeout_seconds)
+    .with_include_changelog(args.shared.include_changelog);
 
     let (successes, failures) = exporter.export_bulk(&issue_keys).await;
     let all_results: Vec<_> = successes.iter().chain(failures.iter()).cloned().collect();
@@ -479,6 +482,7 @@ async fn run_hierarchy_export(
         include_json: shared.include_json,
         attachment_concurrency: shared.attachment_concurrency,
         no_attachments: shared.no_attachments,
+        include_changelog: shared.include_changelog,
     };
 
     let mut exporter = HierarchyExporter::new(client, options);

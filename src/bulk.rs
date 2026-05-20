@@ -42,6 +42,7 @@ pub struct BulkExporter {
     issue_timeout: Duration,
     incremental: bool,
     force: bool,
+    include_changelog: bool,
 }
 
 impl BulkExporter {
@@ -79,7 +80,13 @@ impl BulkExporter {
             issue_timeout: Duration::from_secs(300),
             incremental,
             force,
+            include_changelog: false,
         }
+    }
+
+    pub fn with_include_changelog(mut self, include_changelog: bool) -> Self {
+        self.include_changelog = include_changelog;
+        self
     }
 
     pub fn with_no_attachments(mut self, no_attachments: bool) -> Self {
@@ -125,6 +132,7 @@ impl BulkExporter {
                 let key = key.clone();
                 let manifest_ref = manifest.clone();
                 let force = self.force;
+                let include_changelog = self.include_changelog;
 
                 async move {
                     let _permit = sem.acquire().await.unwrap();
@@ -142,8 +150,25 @@ impl BulkExporter {
                                     let updated =
                                         issue_data["fields"]["updated"].as_str().unwrap_or("");
                                     if !m.is_stale(&key, updated) {
-                                        info!("Skipping {} (unchanged)", key);
                                         let path = output_dir.join(&key);
+                                        // Backfill: if changelog opt-in is on but the file
+                                        // is missing (e.g. user just enabled the flag),
+                                        // fetch and write the changelog without re-fetching
+                                        // or rewriting the main issue payload.
+                                        let changelog_path = path
+                                            .join(format!("{}.changelog.md", key));
+                                        if include_changelog && !changelog_path.exists() {
+                                            backfill_changelog(
+                                                &client,
+                                                &key,
+                                                &path,
+                                                &issue_data,
+                                                json,
+                                            )
+                                            .await;
+                                        } else {
+                                            info!("Skipping {} (unchanged)", key);
+                                        }
                                         return ExportResult {
                                             issue_key: key,
                                             success: true,
@@ -167,6 +192,7 @@ impl BulkExporter {
                                 include_json: json,
                                 attachment_concurrency: att_concurrency,
                                 no_attachments,
+                                include_changelog,
                             },
                         )
                         .await
@@ -308,6 +334,49 @@ impl BulkExporter {
     }
 }
 
+async fn backfill_changelog(
+    client: &JiraApiClient,
+    issue_key: &str,
+    output_path: &std::path::Path,
+    issue_data: &Value,
+    include_json: bool,
+) {
+    use crate::changelog;
+    let entries = match client.fetch_changelog(issue_key).await {
+        Ok(e) => e,
+        Err(e) => {
+            log::warn!(
+                "Backfill: failed to fetch changelog for {}: {}",
+                issue_key,
+                e
+            );
+            return;
+        }
+    };
+    if let Err(e) = tokio::fs::create_dir_all(output_path).await {
+        log::warn!("Backfill: failed to create {:?}: {}", output_path, e);
+        return;
+    }
+    let summary = issue_data["fields"]["summary"].as_str().unwrap_or("");
+    let body = changelog::render_changelog_file(issue_key, summary, &entries, Utc::now());
+    let md_path = output_path.join(format!("{}.changelog.md", issue_key));
+    if let Err(e) = tokio::fs::write(&md_path, body).await {
+        log::warn!("Backfill: failed to write {:?}: {}", md_path, e);
+        return;
+    }
+    info!(
+        "Backfilled changelog for {} ({} rows)",
+        issue_key,
+        changelog::row_count(&entries)
+    );
+    if include_json {
+        let json_path = output_path.join(format!("{}.changelog.json", issue_key));
+        if let Ok(s) = serde_json::to_string_pretty(&entries) {
+            let _ = tokio::fs::write(&json_path, s).await;
+        }
+    }
+}
+
 async fn timeout_export<F>(issue_key: &str, timeout: Duration, export: F) -> ExportResult
 where
     F: std::future::Future<Output = ExportResult>,
@@ -348,6 +417,155 @@ fn finish_message(position: usize, total: usize, result: &ExportResult) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::Manifest;
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn bulk_export_backfills_missing_changelog_md_on_unchanged_issue_under_incremental() {
+        let updated_ts = "2024-05-01T12:00:00.000+0000";
+        let server = BackfillServer::start(updated_ts);
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let output_dir = unique_temp_dir("jarkdown-changelog-backfill");
+
+        // Seed the manifest so K1 appears "unchanged" relative to what the server returns
+        let issue_dir = output_dir.join("K1");
+        std::fs::create_dir_all(&issue_dir).expect("mkdir issue");
+        let mut manifest = Manifest::default();
+        manifest.record("K1", updated_ts);
+        manifest.save(&output_dir).expect("save manifest");
+        // Pre-existing main markdown (proves we won't rewrite it)
+        let main_md = issue_dir.join("K1.md");
+        std::fs::write(&main_md, "PRE-EXISTING").expect("seed main md");
+        let main_mtime_before = std::fs::metadata(&main_md).unwrap().modified().unwrap();
+
+        let mut exporter = BulkExporter::new(
+            client,
+            /* concurrency */ 1,
+            Some(output_dir.to_str().unwrap()),
+            None,
+            false,
+            None,
+            None,
+            false,
+            0,
+            /* incremental */ true,
+            /* force */ false,
+        );
+        exporter = exporter.with_include_changelog(true);
+
+        let (successes, failures) = exporter.export_bulk(&["K1".to_string()]).await;
+        assert_eq!(failures.len(), 0, "no failures expected");
+        assert_eq!(successes.len(), 1);
+
+        let changelog_path = issue_dir.join("K1.changelog.md");
+        assert!(
+            changelog_path.exists(),
+            "changelog must be backfilled even when issue is unchanged"
+        );
+        let body = std::fs::read_to_string(&changelog_path).unwrap();
+        assert!(
+            body.contains("**status**: To Do → In Progress"),
+            "expected rendered bullet; got:\n{}",
+            body
+        );
+
+        // Main md should NOT have been re-written
+        let main_after = std::fs::read_to_string(&main_md).unwrap();
+        assert_eq!(main_after, "PRE-EXISTING", "main .md must be untouched");
+        let main_mtime_after = std::fs::metadata(&main_md).unwrap().modified().unwrap();
+        assert_eq!(
+            main_mtime_before, main_mtime_after,
+            "main .md mtime must not change"
+        );
+
+        std::fs::remove_dir_all(&output_dir).ok();
+    }
+
+    struct BackfillServer {
+        base_url: String,
+    }
+
+    impl BackfillServer {
+        fn start(updated_ts: &'static str) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let base_url = format!("http://{}", addr);
+            let ts: &'static str = updated_ts;
+
+            thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    handle_backfill(stream, ts);
+                }
+            });
+
+            Self { base_url }
+        }
+    }
+
+    fn handle_backfill(mut stream: TcpStream, updated_ts: &str) {
+        let mut buf = [0u8; 8192];
+        let n = stream.read(&mut buf).expect("read");
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let path = req
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_string();
+
+        let body = if path.starts_with("/rest/api/3/issue/K1/changelog") {
+            r#"{"startAt":0,"maxResults":100,"total":1,"isLast":true,"values":[
+                {
+                    "id":"1",
+                    "author":{"displayName":"Jane Smith"},
+                    "created":"2024-01-20T14:32:17.000+0000",
+                    "items":[{"field":"status","fromString":"To Do","toString":"In Progress"}]
+                }
+            ]}"#
+            .to_string()
+        } else if path.starts_with("/rest/api/3/issue/K1") {
+            format!(
+                r#"{{
+                    "key":"K1",
+                    "renderedFields":{{}},
+                    "fields":{{
+                        "summary":"Backfill me",
+                        "updated":"{}",
+                        "description":null,
+                        "issuetype":{{"name":"Task"}},
+                        "status":{{"name":"Open","statusCategory":{{"name":"To Do"}}}},
+                        "priority":{{"name":"Medium"}},
+                        "resolution":null,
+                        "project":{{"name":"P","key":"PROJ"}},
+                        "assignee":null,"reporter":null,"creator":null,
+                        "labels":[],"components":[],"parent":null,"subtasks":[],
+                        "issuelinks":[],"worklog":{{"worklogs":[]}},
+                        "comment":{{"comments":[]}},"attachment":[]
+                    }}
+                }}"#,
+                updated_ts
+            )
+        } else {
+            "{}".to_string()
+        };
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(resp.as_bytes());
+    }
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{}-{}", prefix, nanos))
+    }
 
     #[tokio::test]
     async fn timeout_export_fails_issue_without_waiting_for_future() {

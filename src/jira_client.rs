@@ -210,6 +210,155 @@ impl JiraApiClient {
     }
 }
 
+impl JiraApiClient {
+    /// Fetch the full changelog (audit trail of field changes) for an issue.
+    ///
+    /// Paginates `/rest/api/3/issue/{key}/changelog` via `startAt`/`maxResults`
+    /// until `isLast` is true (or the accumulated count reaches `total`),
+    /// returning every history entry concatenated in the order Jira returned them.
+    pub async fn fetch_changelog(&self, issue_key: &str) -> Result<Vec<Value>> {
+        let url = format!("{}/issue/{}/changelog", self.api_base, issue_key);
+        let page_size: u32 = 100;
+        let mut start_at: u32 = 0;
+        let mut out: Vec<Value> = Vec::new();
+
+        loop {
+            let response = self
+                .client
+                .get(&url)
+                .query(&[
+                    ("startAt", start_at.to_string()),
+                    ("maxResults", page_size.to_string()),
+                ])
+                .send()
+                .await?;
+            let data = Self::handle_response(response, Some(issue_key)).await?;
+
+            if let Some(values) = data["values"].as_array() {
+                out.extend(values.iter().cloned());
+            }
+
+            let is_last = data["isLast"].as_bool().unwrap_or(true);
+            let total = data["total"].as_u64().unwrap_or(out.len() as u64);
+            if is_last || (out.len() as u64) >= total {
+                break;
+            }
+            start_at = out.len() as u32;
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    #[tokio::test]
+    async fn fetch_changelog_concatenates_paginated_pages_in_order() {
+        let server = PaginatedChangelogServer::start();
+        let client = JiraApiClient::new_for_test(&server.base_url);
+
+        let entries = client
+            .fetch_changelog("PROJ-1")
+            .await
+            .expect("fetch_changelog");
+
+        let ids: Vec<&str> = entries
+            .iter()
+            .map(|e| e["id"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["1", "2", "3", "4", "5"],
+            "expected concatenated ids across both pages"
+        );
+        assert!(server.saw_startat(0), "first page request missing");
+        assert!(
+            server.saw_startat(3),
+            "second page request (startAt=3) missing; observed paths: {:?}",
+            server.observed_paths()
+        );
+    }
+
+    struct PaginatedChangelogServer {
+        base_url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl PaginatedChangelogServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+            let addr = listener.local_addr().expect("addr");
+            let base_url = format!("http://{}", addr);
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let t_requests = requests.clone();
+
+            thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    handle(stream, &t_requests);
+                }
+            });
+
+            Self { base_url, requests }
+        }
+
+        fn saw_startat(&self, n: u32) -> bool {
+            let needle = format!("startAt={}", n);
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.contains(&needle))
+        }
+
+        fn observed_paths(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    fn handle(mut stream: TcpStream, requests: &Arc<Mutex<Vec<String>>>) {
+        let mut buf = [0u8; 8192];
+        let n = stream.read(&mut buf).expect("read");
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let path = req
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_string();
+        requests.lock().unwrap().push(path.clone());
+
+        let body = if path.contains("/changelog") {
+            if path.contains("startAt=0") {
+                r#"{"startAt":0,"maxResults":3,"total":5,"isLast":false,"values":[
+                    {"id":"1"},{"id":"2"},{"id":"3"}
+                ]}"#
+                .to_string()
+            } else if path.contains("startAt=3") {
+                r#"{"startAt":3,"maxResults":3,"total":5,"isLast":true,"values":[
+                    {"id":"4"},{"id":"5"}
+                ]}"#
+                .to_string()
+            } else {
+                r#"{"startAt":0,"maxResults":0,"total":0,"isLast":true,"values":[]}"#.to_string()
+            }
+        } else {
+            "{}".to_string()
+        };
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(resp.as_bytes()).expect("write");
+    }
+}
+
 fn base64_encode(input: &str) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let bytes = input.as_bytes();
