@@ -3,13 +3,15 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process;
+use std::time::Duration;
 
 use clap::Parser;
 use log::info;
+use tokio::time;
 
 use jarkdown::bulk::BulkExporter;
 use jarkdown::cli::{self, Cli, Command};
-use jarkdown::export::perform_export;
+use jarkdown::export::{perform_export_with_options, ExportWorkflowOptions};
 use jarkdown::hierarchy::{HierarchyExporter, HierarchyOptions};
 use jarkdown::jira_client::JiraApiClient;
 use jarkdown::manifest::Manifest;
@@ -60,11 +62,7 @@ fn load_credentials() -> (String, String, String) {
         process::exit(1);
     }
 
-    (
-        domain.unwrap(),
-        email.unwrap(),
-        api_token.unwrap(),
-    )
+    (domain.unwrap(), email.unwrap(), api_token.unwrap())
 }
 
 /// Interactive setup to create .env file with Jira credentials.
@@ -214,7 +212,11 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
             .as_ref()
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        run_hierarchy_export(&client, &args.issue_key, &output_dir, &args.shared).await;
+        let result =
+            run_hierarchy_export(&client, &args.issue_key, &output_dir, &args.shared).await;
+        if !result.success {
+            process::exit(1);
+        }
         return;
     }
 
@@ -242,19 +244,34 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
         }
     }
 
-    match perform_export(
+    let export = perform_export_with_options(
         &client,
         &args.issue_key,
         &output_path,
-        args.shared.refresh_fields,
-        args.shared.include_fields.as_deref(),
-        args.shared.exclude_fields.as_deref(),
-        args.shared.include_json,
-        args.shared.attachment_concurrency,
+        ExportWorkflowOptions {
+            refresh_fields: args.shared.refresh_fields,
+            include_fields: args.shared.include_fields.as_deref(),
+            exclude_fields: args.shared.exclude_fields.as_deref(),
+            include_json: args.shared.include_json,
+            attachment_concurrency: args.shared.attachment_concurrency,
+            no_attachments: args.shared.no_attachments,
+        },
+    );
+
+    match time::timeout(
+        Duration::from_secs(args.shared.issue_timeout_seconds),
+        export,
     )
     .await
     {
-        Ok(path) => {
+        Err(_) => {
+            eprintln!(
+                "Error: {} timed out after {}s",
+                args.issue_key, args.shared.issue_timeout_seconds
+            );
+            process::exit(1);
+        }
+        Ok(Ok(path)) => {
             // Update manifest for incremental support
             if args.shared.incremental {
                 let parent_dir = path.parent().unwrap_or(std::path::Path::new("."));
@@ -270,14 +287,17 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
 
             info!("\nSuccessfully exported {} to {:?}", args.issue_key, path);
             if args.shared.include_json {
-                info!("  - Raw JSON: {:?}", path.join(format!("{}.json", args.issue_key)));
+                info!(
+                    "  - Raw JSON: {:?}",
+                    path.join(format!("{}.json", args.issue_key))
+                );
             }
             info!(
                 "  - Markdown file: {:?}",
                 path.join(format!("{}.md", args.issue_key))
             );
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             eprintln!("Error: {}", e);
             process::exit(1);
         }
@@ -304,8 +324,19 @@ async fn handle_bulk(args: jarkdown::cli::BulkArgs) {
             .as_ref()
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let mut successes = Vec::new();
+        let mut failures = Vec::new();
         for key in &args.issue_keys {
-            run_hierarchy_export(&client, key, &output_dir, &args.shared).await;
+            let result = run_hierarchy_export(&client, key, &output_dir, &args.shared).await;
+            if result.success {
+                successes.push(result);
+            } else {
+                failures.push(result);
+            }
+        }
+        print_summary(&successes, &failures);
+        if !failures.is_empty() {
+            process::exit(1);
         }
         return;
     }
@@ -322,7 +353,9 @@ async fn handle_bulk(args: jarkdown::cli::BulkArgs) {
         args.shared.attachment_concurrency,
         args.shared.incremental,
         args.shared.force,
-    );
+    )
+    .with_no_attachments(args.shared.no_attachments)
+    .with_issue_timeout_seconds(args.shared.issue_timeout_seconds);
 
     let (successes, failures) = exporter.export_bulk(&args.issue_keys).await;
     let all_results: Vec<_> = successes.iter().chain(failures.iter()).cloned().collect();
@@ -361,10 +394,15 @@ async fn handle_query(args: jarkdown::cli::QueryArgs) {
         return;
     }
 
-    let issue_keys: Vec<String> = issues
-        .iter()
-        .filter_map(|i| i["key"].as_str().map(|s| s.to_string()))
-        .collect();
+    let issue_keys = issue_keys_from_search_results(&issues);
+
+    if args.keys_only {
+        for key in &issue_keys {
+            println!("{}", key);
+        }
+        return;
+    }
+
     eprintln!("Found {} issues.", issue_keys.len());
 
     // Hierarchy mode: run hierarchy export for each matched issue
@@ -375,8 +413,19 @@ async fn handle_query(args: jarkdown::cli::QueryArgs) {
             .as_ref()
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let mut successes = Vec::new();
+        let mut failures = Vec::new();
         for key in &issue_keys {
-            run_hierarchy_export(&client, key, &output_dir, &args.shared).await;
+            let result = run_hierarchy_export(&client, key, &output_dir, &args.shared).await;
+            if result.success {
+                successes.push(result);
+            } else {
+                failures.push(result);
+            }
+        }
+        print_summary(&successes, &failures);
+        if !failures.is_empty() {
+            process::exit(1);
         }
         return;
     }
@@ -393,18 +442,16 @@ async fn handle_query(args: jarkdown::cli::QueryArgs) {
         args.shared.attachment_concurrency,
         args.shared.incremental,
         args.shared.force,
-    );
+    )
+    .with_no_attachments(args.shared.no_attachments)
+    .with_issue_timeout_seconds(args.shared.issue_timeout_seconds);
 
     let (successes, failures) = exporter.export_bulk(&issue_keys).await;
     let all_results: Vec<_> = successes.iter().chain(failures.iter()).cloned().collect();
 
     let issues_data: HashMap<String, serde_json::Value> = issues
         .into_iter()
-        .filter_map(|i| {
-            i["key"]
-                .as_str()
-                .map(|k| (k.to_string(), i.clone()))
-        })
+        .filter_map(|i| i["key"].as_str().map(|k| (k.to_string(), i.clone())))
         .collect();
 
     if let Err(e) = exporter.write_index_md(&all_results, &issues_data).await {
@@ -422,7 +469,7 @@ async fn run_hierarchy_export(
     issue_key: &str,
     output_dir: &std::path::Path,
     shared: &jarkdown::cli::SharedArgs,
-) {
+) -> jarkdown::ExportResult {
     let options = HierarchyOptions {
         max_depth: shared.max_depth,
         max_issues: shared.max_issues,
@@ -431,25 +478,56 @@ async fn run_hierarchy_export(
         exclude_fields: shared.exclude_fields.clone(),
         include_json: shared.include_json,
         attachment_concurrency: shared.attachment_concurrency,
+        no_attachments: shared.no_attachments,
     };
 
     let mut exporter = HierarchyExporter::new(client, options);
-    match exporter.export_hierarchy(issue_key, output_dir).await {
-        Ok(tree) => {
+    let export = exporter.export_hierarchy(issue_key, output_dir);
+    match time::timeout(Duration::from_secs(shared.issue_timeout_seconds), export).await {
+        Err(_) => {
+            let error = format!("timed out after {}s", shared.issue_timeout_seconds);
+            eprintln!("Error exporting hierarchy for {}: {}", issue_key, error);
+            jarkdown::ExportResult {
+                issue_key: issue_key.to_string(),
+                success: false,
+                output_path: None,
+                error: Some(error),
+            }
+        }
+        Ok(Ok(tree)) => {
             eprintln!(
                 "Exported hierarchy for {} ({} issues)",
                 issue_key,
                 count_nodes(&tree)
             );
+            jarkdown::ExportResult {
+                issue_key: issue_key.to_string(),
+                success: true,
+                output_path: Some(output_dir.join(issue_key)),
+                error: None,
+            }
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             eprintln!("Error exporting hierarchy for {}: {}", issue_key, e);
+            jarkdown::ExportResult {
+                issue_key: issue_key.to_string(),
+                success: false,
+                output_path: None,
+                error: Some(e.to_string()),
+            }
         }
     }
 }
 
 fn count_nodes(node: &jarkdown::IssueNode) -> usize {
     1 + node.children.iter().map(count_nodes).sum::<usize>()
+}
+
+fn issue_keys_from_search_results(issues: &[serde_json::Value]) -> Vec<String> {
+    issues
+        .iter()
+        .filter_map(|i| i["key"].as_str().map(|s| s.to_string()))
+        .collect()
 }
 
 #[tokio::main]
@@ -473,5 +551,22 @@ async fn main() {
             println!();
             process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn issue_keys_from_search_results_extracts_one_key_per_matching_issue() {
+        let issues = vec![
+            json!({"key": "K1"}),
+            json!({"fields": {"summary": "missing key"}}),
+            json!({"key": "K2"}),
+        ];
+
+        assert_eq!(issue_keys_from_search_results(&issues), vec!["K1", "K2"]);
     }
 }

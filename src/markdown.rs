@@ -11,12 +11,20 @@ use crate::config::FieldFilter;
 use crate::custom_field::CustomFieldRenderer;
 use crate::field_cache::FieldMetadataCache;
 
+#[derive(Debug, Clone)]
+struct SkippedAttachment {
+    filename: String,
+    url: Option<String>,
+}
+
 /// Converts Jira issue data into Markdown format.
 pub struct MarkdownConverter {
     base_url: String,
     domain: String,
     attachments_by_id: HashMap<String, DownloadedAttachment>,
     attachments_by_name: HashMap<String, DownloadedAttachment>,
+    skipped_attachments_by_id: HashMap<String, SkippedAttachment>,
+    skipped_attachments_by_name: HashMap<String, SkippedAttachment>,
 }
 
 impl MarkdownConverter {
@@ -26,6 +34,8 @@ impl MarkdownConverter {
             domain: domain.to_string(),
             attachments_by_id: HashMap::new(),
             attachments_by_name: HashMap::new(),
+            skipped_attachments_by_id: HashMap::new(),
+            skipped_attachments_by_name: HashMap::new(),
         }
     }
 
@@ -41,6 +51,28 @@ impl MarkdownConverter {
                 .insert(att.original_filename.to_lowercase(), att.clone());
             self.attachments_by_name
                 .insert(att.filename.to_lowercase(), att.clone());
+        }
+    }
+
+    fn prepare_skipped_attachment_lookup(&mut self, attachments: &[Value]) {
+        self.skipped_attachments_by_id.clear();
+        self.skipped_attachments_by_name.clear();
+
+        for attachment in attachments {
+            let filename = attachment["filename"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string();
+            let skipped = SkippedAttachment {
+                filename: filename.clone(),
+                url: attachment["content"].as_str().map(|s| s.to_string()),
+            };
+            if let Some(id) = attachment["id"].as_str() {
+                self.skipped_attachments_by_id
+                    .insert(id.to_string(), skipped.clone());
+            }
+            self.skipped_attachments_by_name
+                .insert(filename.to_lowercase(), skipped);
         }
     }
 
@@ -63,6 +95,25 @@ impl MarkdownConverter {
         None
     }
 
+    fn get_skipped_attachment_for_media(
+        &self,
+        attachment_id: Option<&str>,
+        filename_hint: Option<&str>,
+    ) -> Option<&SkippedAttachment> {
+        if let Some(id) = attachment_id {
+            if let Some(att) = self.skipped_attachments_by_id.get(id) {
+                return Some(att);
+            }
+        }
+        if let Some(hint) = filename_hint {
+            let normalized = hint.trim().to_lowercase();
+            if let Some(att) = self.skipped_attachments_by_name.get(&normalized) {
+                return Some(att);
+            }
+        }
+        None
+    }
+
     fn media_attrs_to_markdown(&self, attrs: &Value) -> String {
         if !attrs.is_object() {
             return "![attachment](attachment)".to_string();
@@ -77,14 +128,22 @@ impl MarkdownConverter {
 
         if media_type == "external" {
             if let Some(url) = attrs["url"].as_str() {
-                let alt = if filename_hint.is_empty() { url } else { filename_hint };
+                let alt = if filename_hint.is_empty() {
+                    url
+                } else {
+                    filename_hint
+                };
                 return format!("![{}]({})", alt, url);
             }
         }
 
         let att = self.get_attachment_for_media(
             attrs["id"].as_str(),
-            if filename_hint.is_empty() { None } else { Some(filename_hint) },
+            if filename_hint.is_empty() {
+                None
+            } else {
+                Some(filename_hint)
+            },
         );
 
         if let Some(att) = att {
@@ -97,7 +156,30 @@ impl MarkdownConverter {
             return format!("![{}]({})", alt, encoded);
         }
 
-        let alt = if filename_hint.is_empty() { "attachment" } else { filename_hint };
+        if let Some(att) = self.get_skipped_attachment_for_media(
+            attrs["id"].as_str(),
+            if filename_hint.is_empty() {
+                None
+            } else {
+                Some(filename_hint)
+            },
+        ) {
+            let alt = if filename_hint.is_empty() {
+                &att.filename
+            } else {
+                filename_hint
+            };
+            if let Some(url) = &att.url {
+                return format!("[{}]({})", alt, url);
+            }
+            return alt.to_string();
+        }
+
+        let alt = if filename_hint.is_empty() {
+            "attachment"
+        } else {
+            filename_hint
+        };
         format!("![{}](attachment)", alt)
     }
 
@@ -108,9 +190,9 @@ impl MarkdownConverter {
         }
 
         // Remove Atlassian-specific wrappers
-        let re_thumbnail = Regex::new(
-            r"(?si)<jira-attachment-thumbnail[^>]*>(.*?)</jira-attachment-thumbnail>"
-        ).unwrap();
+        let re_thumbnail =
+            Regex::new(r"(?si)<jira-attachment-thumbnail[^>]*>(.*?)</jira-attachment-thumbnail>")
+                .unwrap();
         let html = re_thumbnail.replace_all(html_content, "$1").to_string();
 
         let re_img_link = Regex::new(r"(?si)<a\b[^>]*>\s*(<img\b[^>]*>)\s*</a>").unwrap();
@@ -157,11 +239,15 @@ impl MarkdownConverter {
 
                 // Replace in images
                 if let Ok(re) = Regex::new(&format!(r"(!\[[^\]]*\])\({}(?:\?[^)]*)?\)", pattern)) {
-                    result = re.replace_all(&result, format!("$1({})", encoded)).to_string();
+                    result = re
+                        .replace_all(&result, format!("$1({})", encoded))
+                        .to_string();
                 }
                 // Replace in links
                 if let Ok(re) = Regex::new(&format!(r"(\[[^\]]+\])\({}(?:\?[^)]*)?\)", pattern)) {
-                    result = re.replace_all(&result, format!("$1({})", encoded)).to_string();
+                    result = re
+                        .replace_all(&result, format!("$1({})", encoded))
+                        .to_string();
                 }
             }
 
@@ -170,10 +256,14 @@ impl MarkdownConverter {
                 let id_pattern = format!(r"{}/(?:content|thumbnail)/{}", rest_prefix, escaped_id);
 
                 if let Ok(re) = Regex::new(&format!(r"(!\[[^\]]*\])\({}\)", id_pattern)) {
-                    result = re.replace_all(&result, format!("$1({})", encoded)).to_string();
+                    result = re
+                        .replace_all(&result, format!("$1({})", encoded))
+                        .to_string();
                 }
                 if let Ok(re) = Regex::new(&format!(r"(\[[^\]]+\])\({}\)", id_pattern)) {
-                    result = re.replace_all(&result, format!("$1({})", encoded)).to_string();
+                    result = re
+                        .replace_all(&result, format!("$1({})", encoded))
+                        .to_string();
                 }
             }
         }
@@ -314,7 +404,10 @@ impl MarkdownConverter {
                             .join("\n")
                     })
                     .unwrap_or_default();
-                text.lines().map(|l| format!("> {}", l)).collect::<Vec<_>>().join("\n")
+                text.lines()
+                    .map(|l| format!("> {}", l))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             }
 
             "mediaSingle" => {
@@ -373,7 +466,11 @@ impl MarkdownConverter {
                         if i == 0 {
                             rows.push(format!(
                                 "| {} |",
-                                cell_texts.iter().map(|_| "---").collect::<Vec<_>>().join(" | ")
+                                cell_texts
+                                    .iter()
+                                    .map(|_| "---")
+                                    .collect::<Vec<_>>()
+                                    .join(" | ")
                             ));
                         }
                     }
@@ -518,29 +615,56 @@ impl MarkdownConverter {
         let mut map = serde_yaml::Mapping::new();
 
         let set_str = |map: &mut serde_yaml::Mapping, key: &str, val: Option<&str>| {
-            map.insert(Y::String(key.into()), match val {
-                Some(s) => Y::String(s.to_string()),
-                None => Y::Null,
-            });
+            map.insert(
+                Y::String(key.into()),
+                match val {
+                    Some(s) => Y::String(s.to_string()),
+                    None => Y::Null,
+                },
+            );
         };
 
         set_str(&mut map, "key", issue_data["key"].as_str());
         set_str(&mut map, "summary", fields["summary"].as_str());
         set_str(&mut map, "type", fields["issuetype"]["name"].as_str());
         set_str(&mut map, "status", fields["status"]["name"].as_str());
-        set_str(&mut map, "status_category", fields["status"]["statusCategory"]["name"].as_str());
+        set_str(
+            &mut map,
+            "status_category",
+            fields["status"]["statusCategory"]["name"].as_str(),
+        );
         set_str(&mut map, "priority", fields["priority"]["name"].as_str());
-        set_str(&mut map, "resolution", fields["resolution"]["name"].as_str());
+        set_str(
+            &mut map,
+            "resolution",
+            fields["resolution"]["name"].as_str(),
+        );
         set_str(&mut map, "project", fields["project"]["name"].as_str());
         set_str(&mut map, "project_key", fields["project"]["key"].as_str());
-        set_str(&mut map, "assignee", fields["assignee"]["displayName"].as_str());
-        set_str(&mut map, "reporter", fields["reporter"]["displayName"].as_str());
-        set_str(&mut map, "creator", fields["creator"]["displayName"].as_str());
+        set_str(
+            &mut map,
+            "assignee",
+            fields["assignee"]["displayName"].as_str(),
+        );
+        set_str(
+            &mut map,
+            "reporter",
+            fields["reporter"]["displayName"].as_str(),
+        );
+        set_str(
+            &mut map,
+            "creator",
+            fields["creator"]["displayName"].as_str(),
+        );
 
         // Labels
         let labels: Vec<Y> = fields["labels"]
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| Y::String(s.into()))).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| Y::String(s.into())))
+                    .collect()
+            })
             .unwrap_or_default();
         map.insert(Y::String("labels".into()), Y::Sequence(labels));
 
@@ -557,18 +681,30 @@ impl MarkdownConverter {
 
         // Parent
         set_str(&mut map, "parent_key", fields["parent"]["key"].as_str());
-        set_str(&mut map, "parent_summary", fields["parent"]["fields"]["summary"].as_str());
+        set_str(
+            &mut map,
+            "parent_summary",
+            fields["parent"]["fields"]["summary"].as_str(),
+        );
 
         // Versions
         let affects: Vec<Y> = fields["versions"]
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v["name"].as_str().map(|s| Y::String(s.into()))).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v["name"].as_str().map(|s| Y::String(s.into())))
+                    .collect()
+            })
             .unwrap_or_default();
         map.insert(Y::String("affects_versions".into()), Y::Sequence(affects));
 
         let fix_ver: Vec<Y> = fields["fixVersions"]
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v["name"].as_str().map(|s| Y::String(s.into()))).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v["name"].as_str().map(|s| Y::String(s.into())))
+                    .collect()
+            })
             .unwrap_or_default();
         map.insert(Y::String("fix_versions".into()), Y::Sequence(fix_ver));
 
@@ -580,15 +716,26 @@ impl MarkdownConverter {
 
         // Time tracking
         let tt = &fields["timetracking"];
-        set_str(&mut map, "original_estimate", tt["originalEstimate"].as_str());
+        set_str(
+            &mut map,
+            "original_estimate",
+            tt["originalEstimate"].as_str(),
+        );
         set_str(&mut map, "time_spent", tt["timeSpent"].as_str());
-        set_str(&mut map, "remaining_estimate", tt["remainingEstimate"].as_str());
+        set_str(
+            &mut map,
+            "remaining_estimate",
+            tt["remainingEstimate"].as_str(),
+        );
 
         // Progress
         let progress = fields["progress"]["percent"].as_u64().unwrap_or(0);
         let agg_progress = fields["aggregateprogress"]["percent"].as_u64().unwrap_or(0);
         map.insert(Y::String("progress".into()), Y::Number(progress.into()));
-        map.insert(Y::String("aggregate_progress".into()), Y::Number(agg_progress.into()));
+        map.insert(
+            Y::String("aggregate_progress".into()),
+            Y::Number(agg_progress.into()),
+        );
 
         // Votes and watches
         let votes = fields["votes"]["votes"].as_u64().unwrap_or(0);
@@ -638,15 +785,16 @@ impl MarkdownConverter {
         let mut groups: HashMap<String, Vec<&Value>> = HashMap::new();
         for link in links {
             let link_type = &link["type"];
-            let (label, issue) = if link.get("outwardIssue").is_some() && !link["outwardIssue"].is_null() {
-                let l = link_type["outward"].as_str().unwrap_or("Related");
-                (capitalize(l), &link["outwardIssue"])
-            } else if link.get("inwardIssue").is_some() && !link["inwardIssue"].is_null() {
-                let l = link_type["inward"].as_str().unwrap_or("Related");
-                (capitalize(l), &link["inwardIssue"])
-            } else {
-                continue;
-            };
+            let (label, issue) =
+                if link.get("outwardIssue").is_some() && !link["outwardIssue"].is_null() {
+                    let l = link_type["outward"].as_str().unwrap_or("Related");
+                    (capitalize(l), &link["outwardIssue"])
+                } else if link.get("inwardIssue").is_some() && !link["inwardIssue"].is_null() {
+                    let l = link_type["inward"].as_str().unwrap_or("Related");
+                    (capitalize(l), &link["inwardIssue"])
+                } else {
+                    continue;
+                };
             groups.entry(label).or_default().push(issue);
         }
 
@@ -677,7 +825,9 @@ impl MarkdownConverter {
                     let key = subtask["key"].as_str().unwrap_or("UNKNOWN");
                     let summary = subtask["fields"]["summary"].as_str().unwrap_or("");
                     let status = subtask["fields"]["status"]["name"].as_str().unwrap_or("");
-                    let itype = subtask["fields"]["issuetype"]["name"].as_str().unwrap_or("");
+                    let itype = subtask["fields"]["issuetype"]["name"]
+                        .as_str()
+                        .unwrap_or("");
                     lines.push(format!(
                         "- [{}]({}/browse/{}): {} ({}) \u{2014} {}",
                         key, self.base_url, key, summary, status, itype
@@ -740,7 +890,10 @@ impl MarkdownConverter {
             .iter()
             .map(|e| e["timeSpentSeconds"].as_u64().unwrap_or(0))
             .sum();
-        lines.push(format!("**Total Time Logged:** {}", format_time(total_seconds)));
+        lines.push(format!(
+            "**Total Time Logged:** {}",
+            format_time(total_seconds)
+        ));
         lines.push(String::new());
 
         if total > wl.len() as u64 {
@@ -759,9 +912,18 @@ impl MarkdownConverter {
             let author = entry["author"]["displayName"].as_str().unwrap_or("Unknown");
             let time_spent = entry["timeSpent"].as_str().unwrap_or("");
             let started = entry["started"].as_str().unwrap_or("");
-            let date = if started.len() >= 10 { &started[..10] } else { started };
-            let comment = self.adf_to_plain_text(&entry["comment"]).replace('|', "\\|");
-            lines.push(format!("| {} | {} | {} | {} |", author, time_spent, date, comment));
+            let date = if started.len() >= 10 {
+                &started[..10]
+            } else {
+                started
+            };
+            let comment = self
+                .adf_to_plain_text(&entry["comment"])
+                .replace('|', "\\|");
+            lines.push(format!(
+                "| {} | {} | {} | {} |",
+                author, time_spent, date, comment
+            ));
         }
         lines.push(String::new());
         lines
@@ -858,7 +1020,9 @@ impl MarkdownConverter {
 
         // Build rendered comment lookup
         let mut rendered_lookup: HashMap<String, &Value> = HashMap::new();
-        if let Some(rendered_comments) = issue_data["renderedFields"]["comment"]["comments"].as_array() {
+        if let Some(rendered_comments) =
+            issue_data["renderedFields"]["comment"]["comments"].as_array()
+        {
             for rc in rendered_comments {
                 if let Some(id) = rc["id"].as_str() {
                     rendered_lookup.insert(id.to_string(), rc);
@@ -869,7 +1033,9 @@ impl MarkdownConverter {
         let mut lines = vec!["## Comments".into(), String::new()];
 
         for (i, comment) in comments.iter().enumerate() {
-            let author = comment["author"]["displayName"].as_str().unwrap_or("Unknown");
+            let author = comment["author"]["displayName"]
+                .as_str()
+                .unwrap_or("Unknown");
             let created = comment["created"].as_str().unwrap_or("");
             let formatted_date = format_jira_date(created);
 
@@ -918,15 +1084,19 @@ impl MarkdownConverter {
         &mut self,
         issue_data: &Value,
         downloaded: &[DownloadedAttachment],
+        skipped_attachments: &[Value],
         field_cache: &mut Option<FieldMetadataCache>,
         field_filter: &Option<FieldFilter>,
         child_issues: &[Value],
     ) -> String {
         self.prepare_attachment_lookup(downloaded);
+        self.prepare_skipped_attachment_lookup(skipped_attachments);
 
         let metadata = self.generate_metadata(issue_data);
         let key = issue_data["key"].as_str().unwrap_or("UNKNOWN");
-        let summary = issue_data["fields"]["summary"].as_str().unwrap_or("No Summary");
+        let summary = issue_data["fields"]["summary"]
+            .as_str()
+            .unwrap_or("No Summary");
 
         let mut lines: Vec<String> = Vec::new();
 
@@ -938,7 +1108,10 @@ impl MarkdownConverter {
         lines.push(String::new());
 
         // Title
-        lines.push(format!("# [{}]({}/browse/{}): {}", key, self.base_url, key, summary));
+        lines.push(format!(
+            "# [{}]({}/browse/{}): {}",
+            key, self.base_url, key, summary
+        ));
         lines.push(String::new());
 
         // Description
@@ -978,7 +1151,8 @@ impl MarkdownConverter {
         }
         lines.extend(self.compose_worklogs_section(issue_data));
 
-        let custom_lines = self.compose_custom_fields_section(issue_data, field_cache, field_filter);
+        let custom_lines =
+            self.compose_custom_fields_section(issue_data, field_cache, field_filter);
         if !custom_lines.is_empty() {
             lines.extend(custom_lines);
         }
@@ -998,6 +1172,18 @@ impl MarkdownConverter {
                     lines.push(format!("- ![{}]({})", att.filename, encoded));
                 } else {
                     lines.push(format!("- [{}]({})", att.filename, encoded));
+                }
+            }
+            lines.push(String::new());
+        } else if !skipped_attachments.is_empty() {
+            lines.push("## Attachments".into());
+            lines.push(String::new());
+            for attachment in skipped_attachments {
+                let filename = attachment["filename"].as_str().unwrap_or("unknown");
+                if let Some(url) = attachment["content"].as_str() {
+                    lines.push(format!("- [{}]({})", filename, url));
+                } else {
+                    lines.push(format!("- {}", filename));
                 }
             }
             lines.push(String::new());
@@ -1062,10 +1248,20 @@ fn format_time(seconds: u64) -> String {
     let minutes = remaining / 60;
 
     let mut parts = Vec::new();
-    if days > 0 { parts.push(format!("{}d", days)); }
-    if hours > 0 { parts.push(format!("{}h", hours)); }
-    if minutes > 0 { parts.push(format!("{}m", minutes)); }
-    if parts.is_empty() { "0m".to_string() } else { parts.join(" ") }
+    if days > 0 {
+        parts.push(format!("{}d", days));
+    }
+    if hours > 0 {
+        parts.push(format!("{}h", hours));
+    }
+    if minutes > 0 {
+        parts.push(format!("{}m", minutes));
+    }
+    if parts.is_empty() {
+        "0m".to_string()
+    } else {
+        parts.join(" ")
+    }
 }
 
 fn format_jira_date(created: &str) -> String {
@@ -1087,10 +1283,91 @@ fn format_jira_date(created: &str) -> String {
         Ok(dt) => dt.format("%Y-%m-%d %I:%M %p").to_string(),
         Err(_) => {
             // Try chrono's more lenient parsing
-            match chrono::NaiveDateTime::parse_from_str(&created[..19.min(created.len())], "%Y-%m-%dT%H:%M:%S") {
+            match chrono::NaiveDateTime::parse_from_str(
+                &created[..19.min(created.len())],
+                "%Y-%m-%dT%H:%M:%S",
+            ) {
                 Ok(dt) => dt.format("%Y-%m-%d %I:%M %p").to_string(),
                 Err(_) => created.to_string(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn skipped_attachments_render_names_and_source_urls_without_local_placeholders() {
+        let issue_data = json!({
+            "key": "K1",
+            "renderedFields": {},
+            "fields": {
+                "summary": "Attachment issue",
+                "description": {
+                    "type": "doc",
+                    "content": [
+                        {
+                            "type": "mediaSingle",
+                            "content": [
+                                {
+                                    "type": "media",
+                                    "attrs": {
+                                        "id": "10001",
+                                        "type": "file",
+                                        "alt": "diagram.png"
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "issuetype": { "name": "Task" },
+                "status": { "name": "Open", "statusCategory": { "name": "To Do" } },
+                "priority": { "name": "Medium" },
+                "resolution": null,
+                "project": { "name": "Project", "key": "PROJ" },
+                "assignee": null,
+                "reporter": null,
+                "creator": null,
+                "labels": [],
+                "components": [],
+                "parent": null,
+                "subtasks": [],
+                "issuelinks": [],
+                "worklog": { "worklogs": [] },
+                "comment": { "comments": [] },
+                "attachment": [
+                    {
+                        "id": "10001",
+                        "filename": "diagram.png",
+                        "content": "https://example.atlassian.net/rest/api/3/attachment/content/10001",
+                        "mimeType": "image/png",
+                        "size": 1234
+                    }
+                ]
+            }
+        });
+        let skipped = issue_data["fields"]["attachment"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let mut converter =
+            MarkdownConverter::new("https://example.atlassian.net", "example.atlassian.net");
+
+        let markdown =
+            converter.compose_markdown(&issue_data, &[], &skipped, &mut None, &None, &[]);
+
+        assert!(markdown.contains("## Attachments"));
+        assert!(markdown.contains(
+            "- [diagram.png](https://example.atlassian.net/rest/api/3/attachment/content/10001)"
+        ));
+        assert!(markdown.contains(
+            "[diagram.png](https://example.atlassian.net/rest/api/3/attachment/content/10001)"
+        ));
+        assert!(!markdown.contains("(attachment)"));
+        assert!(!markdown.contains("](diagram.png)"));
     }
 }

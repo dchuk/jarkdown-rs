@@ -103,12 +103,16 @@ jarkdown-rs query 'project = FOO AND status = Done' --limit 100
 # Include raw JSON alongside Markdown
 jarkdown-rs export PROJ-123 --include-json
 
+# Preserve attachment metadata but skip binary downloads
+jarkdown-rs export PROJ-123 --no-attachments --include-json
+
 # Field filtering
 jarkdown-rs export PROJ-123 --include-fields "Story Points,Sprint"
 jarkdown-rs export PROJ-123 --exclude-fields "Internal Notes"
 
 # Parallel attachment downloads
 jarkdown-rs export PROJ-123 --attachment-concurrency 8
+jarkdown-rs export PROJ-123 --attachment-concurrency 0  # serial downloads
 
 # Incremental export (skip unchanged issues)
 jarkdown-rs bulk PROJ-1 PROJ-2 PROJ-3 --incremental
@@ -119,6 +123,12 @@ jarkdown-rs export EPIC-123 --hierarchy
 jarkdown-rs export EPIC-123 --hierarchy --max-depth 3 --max-issues 500
 jarkdown-rs bulk EPIC-1 EPIC-2 --hierarchy
 jarkdown-rs query 'type = Epic AND project = FOO' --hierarchy
+
+# Print matching keys without exporting files
+jarkdown-rs query 'project = FOO AND status = Done' --keys-only
+
+# Bound a slow issue during bulk-style exports
+jarkdown-rs bulk PROJ-1 PROJ-2 PROJ-3 --issue-timeout-seconds 300
 
 # JPD Idea → delivery items (follows "is implemented by" links)
 jarkdown-rs export IDEA-42 --hierarchy --max-depth 3
@@ -137,15 +147,18 @@ jarkdown-rs export PROJ-123 --verbose
 | `--include-fields` | all | none (all fields) |
 | `--exclude-fields` | all | none |
 | `--include-json` | all | off |
+| `--no-attachments` | all | off |
+| `--issue-timeout-seconds` | all | 300 |
 | `--concurrency` | bulk, query | 3 |
 | `--max-results` | query | 50 |
 | `--batch-name` | bulk, query | none |
-| `--attachment-concurrency` | all | 4 |
+| `--attachment-concurrency` | all | 4 (`0` means serial; use `--no-attachments` to skip downloads) |
 | `--incremental` | all | off |
 | `--force` | all | off |
 | `--hierarchy` | all | off |
 | `--max-depth` | all (with `--hierarchy`) | 2 |
 | `--max-issues` | all (with `--hierarchy`) | 200 |
+| `--keys-only` | query | off |
 
 ## Output Structure
 
@@ -238,6 +251,11 @@ exclude = ["Internal Notes", "Dev Notes"]  # or exclude specific fields
 
 CLI flags (`--include-fields`, `--exclude-fields`) override the config file.
 
+The CLI field filters are comma-separated. Field names that contain commas cannot
+be represented as a single CLI value today, so export all fields or use
+`.jarkdown.toml` array values when you need exact names such as
+`Plus, Enterprise, or Both? (G)`.
+
 ## Library Usage
 
 ```rust
@@ -268,6 +286,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ExportOptions {
             include_json: true,
             refresh_fields: true,
+            no_attachments: true,
             ..Default::default()
         },
     ).await?;
@@ -298,7 +317,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         4,      // attachment_concurrency
         false,  // incremental
         false,  // force
-    );
+    )
+    .with_no_attachments(true)
+    .with_issue_timeout_seconds(300);
 
     let keys = vec!["PROJ-1".into(), "PROJ-2".into(), "PROJ-3".into()];
     let (successes, failures) = exporter.export_bulk(&keys).await;
@@ -331,7 +352,8 @@ In `--hierarchy` mode, jarkdown-rs follows the full chain: Idea → Epics → St
 ## Limitations
 
 - **Jira Cloud only** — Server and Data Center instances are not supported
-- Attachment downloads are sequential by default (use `--attachment-concurrency` to parallelize)
+- Attachment downloads are bounded by `--attachment-concurrency`; `0` means serial downloads, and `--no-attachments` skips binary downloads entirely.
+- CLI field filters split on commas, so use `.jarkdown.toml` array values or downstream JSON filtering for field names that contain commas.
 - No webhook/real-time sync — exports are point-in-time snapshots
 
 ## Roadmap

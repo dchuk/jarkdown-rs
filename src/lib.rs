@@ -42,7 +42,7 @@ pub use attachment::DownloadedAttachment;
 pub use bulk::{BulkExporter, ExportResult};
 pub use config::{ConfigManager, FieldFilter};
 pub use error::{JarkdownError, Result};
-pub use export::perform_export;
+pub use export::{perform_export, perform_export_with_options, ExportWorkflowOptions};
 pub use field_cache::FieldMetadataCache;
 pub use hierarchy::{HierarchyExporter, HierarchyOptions, IssueNode};
 pub use jira_client::JiraApiClient;
@@ -60,6 +60,7 @@ pub struct ExportOptions {
     pub exclude_fields: Option<String>,
     pub include_json: bool,
     pub attachment_concurrency: usize,
+    pub no_attachments: bool,
     pub incremental: bool,
     pub force: bool,
 }
@@ -72,6 +73,7 @@ impl Default for ExportOptions {
             exclude_fields: None,
             include_json: false,
             attachment_concurrency: 4,
+            no_attachments: false,
             incremental: false,
             force: false,
         }
@@ -96,23 +98,24 @@ pub async fn export_issue(
     output_dir: Option<&Path>,
     options: ExportOptions,
 ) -> Result<PathBuf> {
-    let output_path = output_dir
-        .map(|d| d.join(issue_key))
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(issue_key)
-        });
+    let output_path = output_dir.map(|d| d.join(issue_key)).unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(issue_key)
+    });
 
-    perform_export(
+    perform_export_with_options(
         client,
         issue_key,
         &output_path,
-        options.refresh_fields,
-        options.include_fields.as_deref(),
-        options.exclude_fields.as_deref(),
-        options.include_json,
-        options.attachment_concurrency,
+        ExportWorkflowOptions {
+            refresh_fields: options.refresh_fields,
+            include_fields: options.include_fields.as_deref(),
+            exclude_fields: options.exclude_fields.as_deref(),
+            include_json: options.include_json,
+            attachment_concurrency: options.attachment_concurrency,
+            no_attachments: options.no_attachments,
+        },
     )
     .await
 }

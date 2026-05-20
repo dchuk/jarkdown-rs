@@ -161,6 +161,7 @@ impl<'a> AttachmentHandler<'a> {
 
         tokio::fs::create_dir_all(output_dir).await.ok();
         info!("Downloading {} attachment(s)...", attachments.len());
+        let concurrency = concurrency.max(1);
 
         // Phase 1: Resolve all filenames synchronously (no races)
         let mut used_names = HashSet::new();

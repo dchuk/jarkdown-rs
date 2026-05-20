@@ -5,14 +5,14 @@
 //! into a tree-structured directory.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::future::Future;
 
 use log::{info, warn};
 
 use crate::error::Result;
-use crate::export::perform_export;
+use crate::export::{perform_export_with_options, ExportWorkflowOptions};
 use crate::field_cache::FieldMetadataCache;
 use crate::jira_client::JiraApiClient;
 
@@ -35,6 +35,7 @@ pub struct HierarchyOptions {
     pub exclude_fields: Option<String>,
     pub include_json: bool,
     pub attachment_concurrency: usize,
+    pub no_attachments: bool,
 }
 
 /// Orchestrates discovery and export of an issue hierarchy.
@@ -111,15 +112,18 @@ impl<'a> HierarchyExporter<'a> {
 
         // Export this issue
         let issue_dir = output_dir.join(issue_key);
-        perform_export(
+        perform_export_with_options(
             self.api_client,
             issue_key,
             &issue_dir,
-            self.options.refresh_fields,
-            self.options.include_fields.as_deref(),
-            self.options.exclude_fields.as_deref(),
-            self.options.include_json,
-            self.options.attachment_concurrency,
+            ExportWorkflowOptions {
+                refresh_fields: self.options.refresh_fields,
+                include_fields: self.options.include_fields.as_deref(),
+                exclude_fields: self.options.exclude_fields.as_deref(),
+                include_json: self.options.include_json,
+                attachment_concurrency: self.options.attachment_concurrency,
+                no_attachments: self.options.no_attachments,
+            },
         )
         .await?;
 
@@ -197,7 +201,12 @@ impl<'a> HierarchyExporter<'a> {
                 break;
             }
             match self
-                .build_tree(child_key, &output_dir.join(issue_key), depth + 1, epic_link_field)
+                .build_tree(
+                    child_key,
+                    &output_dir.join(issue_key),
+                    depth + 1,
+                    epic_link_field,
+                )
                 .await
             {
                 Ok(child_node) => children.push(child_node),
@@ -278,12 +287,7 @@ impl<'a> HierarchyExporter<'a> {
     }
 }
 
-fn render_tree_node(
-    node: &IssueNode,
-    prefix: &str,
-    is_last: bool,
-    lines: &mut Vec<String>,
-) {
+fn render_tree_node(node: &IssueNode, prefix: &str, is_last: bool, lines: &mut Vec<String>) {
     let connector = if prefix.is_empty() {
         ""
     } else if is_last {
@@ -336,4 +340,198 @@ fn is_parent_link_type(link_type: &str) -> bool {
         || lower.contains("is epic of")
         || lower.contains("is parent of")
         || lower.contains("is implemented by")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jira_client::JiraApiClient;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn hierarchy_export_with_no_attachments_writes_markdown_and_json_without_downloading_binaries(
+    ) {
+        let server = TestJiraServer::start();
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let output_dir = unique_temp_dir("jarkdown-no-attachments");
+        let options = HierarchyOptions {
+            max_depth: 3,
+            max_issues: 10,
+            refresh_fields: false,
+            include_fields: None,
+            exclude_fields: None,
+            include_json: true,
+            attachment_concurrency: 4,
+            no_attachments: true,
+        };
+
+        let mut exporter = HierarchyExporter::new(&client, options);
+        let tree = exporter
+            .export_hierarchy("K1", &output_dir)
+            .await
+            .expect("hierarchy export");
+
+        assert_eq!(tree.key, "K1");
+        let issue_dir = output_dir.join("K1");
+        let markdown = tokio::fs::read_to_string(issue_dir.join("K1.md"))
+            .await
+            .expect("markdown file");
+        let json: serde_json::Value = serde_json::from_str(
+            &tokio::fs::read_to_string(issue_dir.join("K1.json"))
+                .await
+                .expect("json file"),
+        )
+        .expect("issue json");
+
+        assert!(markdown.contains("## Attachments"));
+        assert!(markdown.contains("[diagram.png]"));
+        assert_eq!(
+            json["fields"]["attachment"][0]["filename"].as_str(),
+            Some("diagram.png")
+        );
+        assert!(!issue_dir.join("diagram.png").exists());
+        assert!(
+            !server.requested_path_containing("/attachment/content/10001"),
+            "attachment content endpoint must not be requested"
+        );
+        std::fs::remove_dir_all(output_dir).ok();
+    }
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{}-{}", prefix, nanos))
+    }
+
+    struct TestJiraServer {
+        base_url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl TestJiraServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("test server bind");
+            let addr = listener.local_addr().expect("test server addr");
+            let base_url = format!("http://{}", addr);
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let thread_requests = requests.clone();
+            let thread_base_url = base_url.clone();
+
+            thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    handle_request(stream, &thread_requests, &thread_base_url);
+                }
+            });
+
+            Self { base_url, requests }
+        }
+
+        fn requested_path_containing(&self, needle: &str) -> bool {
+            self.requests
+                .lock()
+                .expect("request log")
+                .iter()
+                .any(|path| path.contains(needle))
+        }
+    }
+
+    fn handle_request(mut stream: TcpStream, requests: &Arc<Mutex<Vec<String>>>, base_url: &str) {
+        let mut buffer = [0; 8192];
+        let bytes_read = stream.read(&mut buffer).expect("read request");
+        let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+        let path = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_string();
+        requests.lock().expect("request log").push(path.clone());
+
+        let body = if path.starts_with("/rest/api/3/issue/K1") {
+            issue_response(base_url)
+        } else if path.starts_with("/rest/api/3/field") {
+            "[]".to_string()
+        } else if path.starts_with("/rest/api/3/search/jql") {
+            r#"{"issues":[]}"#.to_string()
+        } else if path.starts_with("/rest/api/3/attachment/content/10001") {
+            "unexpected binary download".to_string()
+        } else {
+            "{}".to_string()
+        };
+        let status = if path.starts_with("/rest/api/3/attachment/content/10001") {
+            "500 Internal Server Error"
+        } else {
+            "200 OK"
+        };
+        let response = format!(
+            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status,
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write response");
+    }
+
+    fn issue_response(base_url: &str) -> String {
+        format!(
+            r#"{{
+            "key": "K1",
+            "renderedFields": {{}},
+            "fields": {{
+                "summary": "Attachment issue",
+                "description": {{
+                    "type": "doc",
+                    "content": [
+                        {{
+                            "type": "mediaSingle",
+                            "content": [
+                                {{
+                                    "type": "media",
+                                    "attrs": {{
+                                        "id": "10001",
+                                        "type": "file",
+                                        "alt": "diagram.png"
+                                    }}
+                                }}
+                            ]
+                        }}
+                    ]
+                }},
+                "issuetype": {{ "name": "Task" }},
+                "status": {{ "name": "Open", "statusCategory": {{ "name": "To Do" }} }},
+                "priority": {{ "name": "Medium" }},
+                "resolution": null,
+                "project": {{ "name": "Project", "key": "PROJ" }},
+                "assignee": null,
+                "reporter": null,
+                "creator": null,
+                "labels": [],
+                "components": [],
+                "parent": null,
+                "subtasks": [],
+                "issuelinks": [],
+                "worklog": {{ "worklogs": [] }},
+                "comment": {{ "comments": [] }},
+                "attachment": [
+                    {{
+                        "id": "10001",
+                        "filename": "diagram.png",
+                        "content": "{}/rest/api/3/attachment/content/10001",
+                        "mimeType": "image/png",
+                        "size": 1234
+                    }}
+                ]
+            }}
+        }}"#,
+            base_url
+        )
+    }
 }

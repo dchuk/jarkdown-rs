@@ -67,9 +67,17 @@ pub struct SharedArgs {
     #[arg(long)]
     pub include_json: bool,
 
-    /// Maximum concurrent attachment downloads (default: 4)
+    /// Maximum concurrent attachment downloads; 0 downloads serially (default: 4)
     #[arg(long, default_value = "4")]
     pub attachment_concurrency: usize,
+
+    /// Skip attachment binary downloads while preserving attachment metadata
+    #[arg(long)]
+    pub no_attachments: bool,
+
+    /// Maximum seconds to spend exporting one issue before timing out
+    #[arg(long, default_value = "300")]
+    pub issue_timeout_seconds: u64,
 
     /// Only re-export issues that have changed since last export
     #[arg(long)]
@@ -138,6 +146,10 @@ pub struct QueryArgs {
     /// Maximum concurrent exports (default: 3)
     #[arg(long, default_value = "3")]
     pub concurrency: usize,
+
+    /// Print matching issue keys and skip file export
+    #[arg(long)]
+    pub keys_only: bool,
 
     #[command(flatten)]
     pub shared: SharedArgs,

@@ -2,14 +2,25 @@
 
 use std::path::{Path, PathBuf};
 
-use log::{info, warn};
-use serde_json::Value;
 use crate::attachment::AttachmentHandler;
 use crate::config::ConfigManager;
 use crate::error::Result;
 use crate::field_cache::FieldMetadataCache;
 use crate::jira_client::JiraApiClient;
 use crate::markdown::MarkdownConverter;
+use log::{info, warn};
+use serde_json::Value;
+
+/// Options for the shared export workflow.
+#[derive(Debug, Clone, Default)]
+pub struct ExportWorkflowOptions<'a> {
+    pub refresh_fields: bool,
+    pub include_fields: Option<&'a str>,
+    pub exclude_fields: Option<&'a str>,
+    pub include_json: bool,
+    pub attachment_concurrency: usize,
+    pub no_attachments: bool,
+}
 
 /// Run the full export workflow for a single Jira issue.
 ///
@@ -26,6 +37,29 @@ pub async fn perform_export(
     include_json: bool,
     attachment_concurrency: usize,
 ) -> Result<PathBuf> {
+    perform_export_with_options(
+        api_client,
+        issue_key,
+        output_path,
+        ExportWorkflowOptions {
+            refresh_fields,
+            include_fields,
+            exclude_fields,
+            include_json,
+            attachment_concurrency,
+            no_attachments: false,
+        },
+    )
+    .await
+}
+
+/// Run the full export workflow with explicit options.
+pub async fn perform_export_with_options(
+    api_client: &JiraApiClient,
+    issue_key: &str,
+    output_path: &Path,
+    options: ExportWorkflowOptions<'_>,
+) -> Result<PathBuf> {
     // Ensure output directory exists
     tokio::fs::create_dir_all(output_path).await?;
 
@@ -38,11 +72,17 @@ pub async fn perform_export(
         .as_array()
         .cloned()
         .unwrap_or_default();
-    let downloaded = handler.download_all_attachments(&attachments, output_path, attachment_concurrency).await;
+    let downloaded = if options.no_attachments {
+        Vec::new()
+    } else {
+        handler
+            .download_all_attachments(&attachments, output_path, options.attachment_concurrency)
+            .await
+    };
 
     // Build field metadata cache
     let mut field_cache = FieldMetadataCache::new(&api_client.domain);
-    if refresh_fields || field_cache.is_stale() {
+    if options.refresh_fields || field_cache.is_stale() {
         match api_client.fetch_fields().await {
             Ok(fields) => {
                 field_cache.save(&fields);
@@ -56,7 +96,8 @@ pub async fn perform_export(
 
     // Build field filter
     let config_manager = ConfigManager::new(None);
-    let field_filter = config_manager.get_field_filter(include_fields, exclude_fields);
+    let field_filter =
+        config_manager.get_field_filter(options.include_fields, options.exclude_fields);
 
     // Discover child issues for Epics (via JQL) and Ideas (via issue links)
     let child_issues = {
@@ -90,13 +131,18 @@ pub async fn perform_export(
     let markdown_content = converter.compose_markdown(
         &issue_data,
         &downloaded,
+        if options.no_attachments {
+            &attachments
+        } else {
+            &[]
+        },
         &mut cache_opt,
         &filter_opt,
         &child_issues,
     );
 
     // Write raw JSON (opt-in)
-    if include_json {
+    if options.include_json {
         let json_file = output_path.join(format!("{}.json", issue_key));
         let json_str = serde_json::to_string_pretty(&issue_data)?;
         tokio::fs::write(&json_file, json_str).await?;

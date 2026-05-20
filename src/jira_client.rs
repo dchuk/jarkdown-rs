@@ -41,9 +41,34 @@ impl JiraApiClient {
             .timeout(std::time::Duration::from_secs(30))
             .default_headers(headers)
             .build()
-            .map_err(|e| JarkdownError::Unexpected(format!("Failed to build HTTP client: {}", e)))?;
+            .map_err(|e| {
+                JarkdownError::Unexpected(format!("Failed to build HTTP client: {}", e))
+            })?;
 
-        Ok(Self { domain: domain.to_string(), base_url, api_base, client })
+        Ok(Self {
+            domain: domain.to_string(),
+            base_url,
+            api_base,
+            client,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test(base_url: &str) -> Self {
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("test HTTP client");
+        let domain = base_url
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .to_string();
+        Self {
+            domain,
+            base_url: base_url.to_string(),
+            api_base: format!("{}/rest/api/3", base_url),
+            client,
+        }
     }
 
     /// Fetch issue data from Jira API.
@@ -51,9 +76,12 @@ impl JiraApiClient {
         let url = format!("{}/issue/{}", self.api_base, issue_key);
         info!("Fetching issue {}...", issue_key);
 
-        let response = self.client.get(&url)
+        let response = self
+            .client
+            .get(&url)
             .query(&[("fields", "*all"), ("expand", "renderedFields")])
-            .send().await?;
+            .send()
+            .await?;
 
         Self::handle_response(response, Some(issue_key)).await
     }

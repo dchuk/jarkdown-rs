@@ -1,18 +1,21 @@
 //! Bulk export engine for exporting multiple Jira issues concurrently.
 
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use chrono::Utc;
 use futures::stream::{self, StreamExt};
 use serde_json::Value;
-use tokio::sync::Semaphore;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
+use tokio::time;
 
 use log::info;
 
 use crate::error::Result;
-use crate::export::perform_export;
+use crate::export::{perform_export_with_options, ExportWorkflowOptions};
 use crate::jira_client::JiraApiClient;
 use crate::manifest::Manifest;
 
@@ -35,6 +38,8 @@ pub struct BulkExporter {
     exclude_fields: Option<String>,
     include_json: bool,
     attachment_concurrency: usize,
+    no_attachments: bool,
+    issue_timeout: Duration,
     incremental: bool,
     force: bool,
 }
@@ -70,9 +75,21 @@ impl BulkExporter {
             exclude_fields: exclude_fields.map(|s| s.to_string()),
             include_json,
             attachment_concurrency,
+            no_attachments: false,
+            issue_timeout: Duration::from_secs(300),
             incremental,
             force,
         }
+    }
+
+    pub fn with_no_attachments(mut self, no_attachments: bool) -> Self {
+        self.no_attachments = no_attachments;
+        self
+    }
+
+    pub fn with_issue_timeout_seconds(mut self, seconds: u64) -> Self {
+        self.issue_timeout = Duration::from_secs(seconds);
+        self
     }
 
     /// Export multiple issues concurrently with semaphore-limited concurrency.
@@ -81,6 +98,10 @@ impl BulkExporter {
         issue_keys: &[String],
     ) -> (Vec<ExportResult>, Vec<ExportResult>) {
         let total = issue_keys.len();
+        if total == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        let stderr_is_terminal = std::io::stderr().is_terminal();
 
         // Load manifest for incremental support
         let manifest = if self.incremental {
@@ -99,68 +120,84 @@ impl BulkExporter {
                 let exc = self.exclude_fields.clone();
                 let json = self.include_json;
                 let att_concurrency = self.attachment_concurrency;
+                let no_attachments = self.no_attachments;
+                let issue_timeout = self.issue_timeout;
                 let key = key.clone();
                 let manifest_ref = manifest.clone();
                 let force = self.force;
 
                 async move {
                     let _permit = sem.acquire().await.unwrap();
-                    eprint!("\rExporting {}/{}... ({})", i + 1, total, key);
+                    emit_progress(
+                        stderr_is_terminal,
+                        &format!("Exporting {}/{}... ({})", i + 1, total, key),
+                    );
 
-                    // Incremental check: fetch issue metadata to compare timestamps
-                    if let Some(ref m) = manifest_ref {
-                        if !force {
-                            if let Ok(issue_data) = client.fetch_issue(&key).await {
-                                let updated = issue_data["fields"]["updated"]
-                                    .as_str()
-                                    .unwrap_or("");
-                                if !m.is_stale(&key, updated) {
-                                    info!("Skipping {} (unchanged)", key);
-                                    let path = output_dir.join(&key);
-                                    return ExportResult {
-                                        issue_key: key,
-                                        success: true,
-                                        output_path: Some(path),
-                                        error: None,
-                                    };
+                    let key_for_timeout = key.clone();
+                    let export = async {
+                        // Incremental check: fetch issue metadata to compare timestamps
+                        if let Some(ref m) = manifest_ref {
+                            if !force {
+                                if let Ok(issue_data) = client.fetch_issue(&key).await {
+                                    let updated =
+                                        issue_data["fields"]["updated"].as_str().unwrap_or("");
+                                    if !m.is_stale(&key, updated) {
+                                        info!("Skipping {} (unchanged)", key);
+                                        let path = output_dir.join(&key);
+                                        return ExportResult {
+                                            issue_key: key,
+                                            success: true,
+                                            output_path: Some(path),
+                                            error: None,
+                                        };
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    let output_path = output_dir.join(&key);
-                    match perform_export(
-                        &client,
-                        &key,
-                        &output_path,
-                        refresh,
-                        inc.as_deref(),
-                        exc.as_deref(),
-                        json,
-                        att_concurrency,
-                    )
-                    .await
-                    {
-                        Ok(path) => ExportResult {
-                            issue_key: key,
-                            success: true,
-                            output_path: Some(path),
-                            error: None,
-                        },
-                        Err(e) => ExportResult {
-                            issue_key: key,
-                            success: false,
-                            output_path: None,
-                            error: Some(e.to_string()),
-                        },
-                    }
+                        let output_path = output_dir.join(&key);
+                        match perform_export_with_options(
+                            &client,
+                            &key,
+                            &output_path,
+                            ExportWorkflowOptions {
+                                refresh_fields: refresh,
+                                include_fields: inc.as_deref(),
+                                exclude_fields: exc.as_deref(),
+                                include_json: json,
+                                attachment_concurrency: att_concurrency,
+                                no_attachments,
+                            },
+                        )
+                        .await
+                        {
+                            Ok(path) => ExportResult {
+                                issue_key: key,
+                                success: true,
+                                output_path: Some(path),
+                                error: None,
+                            },
+                            Err(e) => ExportResult {
+                                issue_key: key,
+                                success: false,
+                                output_path: None,
+                                error: Some(e.to_string()),
+                            },
+                        }
+                    };
+
+                    let result = timeout_export(&key_for_timeout, issue_timeout, export).await;
+                    emit_progress(stderr_is_terminal, &finish_message(i + 1, total, &result));
+                    result
                 }
             })
             .buffer_unordered(total)
             .collect()
             .await;
 
-        eprintln!(); // newline after progress
+        if stderr_is_terminal {
+            eprintln!(); // newline after progress
+        }
 
         // Update manifest with successful exports
         if self.incremental {
@@ -219,9 +256,7 @@ impl BulkExporter {
             let issue_data = all_issues_data.get(&result.issue_key);
             let fields = issue_data.map(|d| &d["fields"]);
 
-            let summary = fields
-                .and_then(|f| f["summary"].as_str())
-                .unwrap_or("-");
+            let summary = fields.and_then(|f| f["summary"].as_str()).unwrap_or("-");
             let status = fields
                 .and_then(|f| f["status"]["name"].as_str())
                 .unwrap_or("-");
@@ -270,5 +305,84 @@ impl BulkExporter {
         let index_path = self.output_dir.join("index.md");
         tokio::fs::write(&index_path, content).await?;
         Ok(())
+    }
+}
+
+async fn timeout_export<F>(issue_key: &str, timeout: Duration, export: F) -> ExportResult
+where
+    F: std::future::Future<Output = ExportResult>,
+{
+    match time::timeout(timeout, export).await {
+        Ok(result) => result,
+        Err(_) => ExportResult {
+            issue_key: issue_key.to_string(),
+            success: false,
+            output_path: None,
+            error: Some(format!("timed out after {}s", timeout.as_secs())),
+        },
+    }
+}
+
+fn emit_progress(stderr_is_terminal: bool, message: &str) {
+    if stderr_is_terminal {
+        eprint!("\r{}", message);
+    } else {
+        eprintln!("{}", message);
+    }
+}
+
+fn finish_message(position: usize, total: usize, result: &ExportResult) -> String {
+    if result.success {
+        format!("Finished {}/{}... ({})", position, total, result.issue_key)
+    } else {
+        format!(
+            "Failed {}/{}... ({}): {}",
+            position,
+            total,
+            result.issue_key,
+            result.error.as_deref().unwrap_or("Unknown error")
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn timeout_export_fails_issue_without_waiting_for_future() {
+        let result = timeout_export("K1", Duration::from_millis(5), async {
+            time::sleep(Duration::from_secs(60)).await;
+            ExportResult {
+                issue_key: "K1".to_string(),
+                success: true,
+                output_path: None,
+                error: None,
+            }
+        })
+        .await;
+
+        assert_eq!(result.issue_key, "K1");
+        assert!(!result.success);
+        assert_eq!(result.error.as_deref(), Some("timed out after 0s"));
+    }
+
+    #[test]
+    fn finish_message_includes_success_and_failure_states() {
+        let success = ExportResult {
+            issue_key: "K1".to_string(),
+            success: true,
+            output_path: None,
+            error: None,
+        };
+        let failure = ExportResult {
+            issue_key: "K2".to_string(),
+            success: false,
+            output_path: None,
+            error: Some("boom".to_string()),
+        };
+
+        assert_eq!(finish_message(1, 2, &success), "Finished 1/2... (K1)");
+        assert_eq!(finish_message(2, 2, &failure), "Failed 2/2... (K2): boom");
     }
 }
