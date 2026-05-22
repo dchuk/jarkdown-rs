@@ -82,6 +82,35 @@ pub struct Comment {
     pub body: RichText,
 }
 
+/// A single Jira changelog history entry, parsed at the HTTP seam.
+///
+/// Retains `raw` per ADR-0002 so `{KEY}.changelog.json` is byte-identical to
+/// the payload Jira returned. The typed "spine" fields (`id`, `author`,
+/// `created`, `items`) cover everything the renderer needs; auxiliary fields
+/// like `historyMetadata` live only in `raw`.
+#[derive(Debug, Clone)]
+pub struct ChangelogEntry {
+    /// The untouched history entry payload. See ADR-0002 — do not remove.
+    pub raw: Value,
+    pub id: String,
+    /// `author.displayName`. Empty string when the `author` key is absent or
+    /// `null` (some system entries have no author).
+    pub author: String,
+    /// ISO timestamp exactly as Jira returned it.
+    pub created: String,
+    pub items: Vec<ChangelogItem>,
+}
+
+/// A single field-change inside a [`ChangelogEntry`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangelogItem {
+    pub field: String,
+    /// `null` or absent → `None`; the renderer prints this as `∅`.
+    pub from_string: Option<String>,
+    /// `null` or absent → `None`; the renderer prints this as `∅`.
+    pub to_string: Option<String>,
+}
+
 /// A fully-fetched Jira issue: the untouched payload (`raw`) plus the typed
 /// "spine" fields the rest of the codebase relies on.
 #[derive(Debug, Clone)]
@@ -289,6 +318,65 @@ impl Issue {
     }
 }
 
+impl ChangelogEntry {
+    /// Parse a single changelog history entry into a typed
+    /// [`ChangelogEntry`], retaining `raw` for byte-identical `.changelog.json`
+    /// serialization.
+    ///
+    /// Shape rules mirror [`Issue::from_value`]: absent/`null` fields degrade
+    /// to empty defaults (`author` legitimately absent on some system
+    /// entries), but a present-but-wrong-typed field is a hard
+    /// [`JarkdownError::MalformedPayload`].
+    pub fn from_value(raw: Value) -> Result<ChangelogEntry> {
+        if !raw.is_object() {
+            return Err(malformed("changelog[]"));
+        }
+
+        let id;
+        let author;
+        let created;
+        let items;
+        {
+            id = parse_string(&raw["id"], "changelog[].id")?;
+            // `author` may be absent entirely; indexing a missing key yields
+            // `Value::Null`, which `parse_string` collapses to "".
+            author = parse_string(
+                &raw["author"]["displayName"],
+                "changelog[].author.displayName",
+            )?;
+            created = parse_string(&raw["created"], "changelog[].created")?;
+
+            let raw_items = parse_array(&raw["items"], "changelog[].items")?;
+            let mut parsed_items = Vec::with_capacity(raw_items.len());
+            for item in &raw_items {
+                if !item.is_object() && !item.is_null() {
+                    return Err(malformed("changelog[].items[]"));
+                }
+                parsed_items.push(ChangelogItem {
+                    field: parse_string(&item["field"], "changelog[].items[].field")?,
+                    from_string: parse_opt_string(
+                        &item["fromString"],
+                        "changelog[].items[].fromString",
+                    )?,
+                    to_string: parse_opt_string(
+                        &item["toString"],
+                        "changelog[].items[].toString",
+                    )?,
+                });
+            }
+            items = parsed_items;
+        }
+
+        Ok(ChangelogEntry {
+            raw,
+            id,
+            author,
+            created,
+            items,
+        })
+    }
+}
+
 impl IssueSearchResult {
     /// Parse a single `search_jql` hit into a typed [`IssueSearchResult`].
     pub fn from_value(raw: Value) -> Result<IssueSearchResult> {
@@ -394,6 +482,91 @@ mod tests {
         assert_eq!(issue.comments.len(), 1);
         assert_eq!(issue.comments[0].author, "Bob");
         assert_eq!(issue.comments[0].body, RichText::Html("<p>hi</p>".to_string()));
+    }
+
+    #[test]
+    fn changelog_entry_from_value_parses_typed_fields_and_retains_raw() {
+        let raw = json!({
+            "id": "9827921",
+            "author": { "displayName": "Jane Smith" },
+            "created": "2026-05-06T15:52:53.582-0700",
+            "items": [
+                {
+                    "field": "assignee",
+                    "fieldId": "assignee",
+                    "fieldtype": "jira",
+                    "from": null,
+                    "fromString": "Old User",
+                    "to": null,
+                    "toString": null
+                },
+                {
+                    "field": "status",
+                    "fieldId": "status",
+                    "fieldtype": "jira",
+                    "from": "1",
+                    "fromString": null,
+                    "to": "3",
+                    "toString": "In Progress"
+                }
+            ],
+            "historyMetadata": { "type": "myType" }
+        });
+
+        let entry = ChangelogEntry::from_value(raw.clone()).expect("parse");
+        assert_eq!(entry.id, "9827921");
+        assert_eq!(entry.author, "Jane Smith");
+        assert_eq!(entry.created, "2026-05-06T15:52:53.582-0700");
+        assert_eq!(entry.items.len(), 2);
+        assert_eq!(entry.items[0].field, "assignee");
+        assert_eq!(entry.items[0].from_string.as_deref(), Some("Old User"));
+        assert_eq!(entry.items[0].to_string, None);
+        assert_eq!(entry.items[1].field, "status");
+        assert_eq!(entry.items[1].from_string, None);
+        assert_eq!(entry.items[1].to_string.as_deref(), Some("In Progress"));
+        // ADR-0002: the raw payload is retained byte-for-byte so that the
+        // sibling `.changelog.json` artifact can be re-serialized losslessly.
+        assert_eq!(entry.raw, raw);
+    }
+
+    #[test]
+    fn changelog_entry_from_value_tolerates_absent_author_but_rejects_wrong_types() {
+        // (a) Some system-generated entries omit `author` entirely (mirrors
+        // PSOP-5624 entry id=9827921 in the baseline).
+        let ok = ChangelogEntry::from_value(json!({
+            "id": "9827921",
+            "created": "2026-05-06T15:52:53.582-0700",
+            "items": [
+                { "field": "Insights", "fromString": null, "toString": "0" }
+            ]
+        }))
+        .expect("absent author tolerated");
+        assert_eq!(ok.author, "");
+        assert_eq!(ok.id, "9827921");
+        assert_eq!(ok.items.len(), 1);
+
+        // (b) `created` present as an integer is hard schema drift.
+        let bad_created = ChangelogEntry::from_value(json!({
+            "id": "x",
+            "created": 12345,
+            "items": []
+        }));
+        assert!(matches!(
+            bad_created,
+            Err(JarkdownError::MalformedPayload(_))
+        ));
+
+        // (c) `items` present as an object instead of an array is hard
+        // schema drift.
+        let bad_items = ChangelogEntry::from_value(json!({
+            "id": "x",
+            "created": "2026-01-01T00:00:00.000+0000",
+            "items": { "not": "an array" }
+        }));
+        assert!(matches!(
+            bad_items,
+            Err(JarkdownError::MalformedPayload(_))
+        ));
     }
 
     #[test]

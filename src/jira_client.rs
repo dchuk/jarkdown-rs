@@ -6,7 +6,7 @@ use reqwest::{Client, Response, StatusCode};
 use serde_json::Value;
 
 use crate::error::{JarkdownError, Result};
-use crate::issue::{Issue, IssueSearchResult};
+use crate::issue::{ChangelogEntry, Issue, IssueSearchResult};
 use crate::retry::{retry_with_backoff, RetryConfig};
 
 /// Handles all communication with the Jira Cloud REST API.
@@ -224,12 +224,13 @@ impl JiraApiClient {
     ///
     /// Paginates `/rest/api/3/issue/{key}/changelog` via `startAt`/`maxResults`
     /// until `isLast` is true (or the accumulated count reaches `total`),
-    /// returning every history entry concatenated in the order Jira returned them.
-    pub async fn fetch_changelog(&self, issue_key: &str) -> Result<Vec<Value>> {
+    /// parsing each page's `values` into typed [`ChangelogEntry`]s and
+    /// returning them concatenated in the order Jira returned them.
+    pub async fn fetch_changelog(&self, issue_key: &str) -> Result<Vec<ChangelogEntry>> {
         let url = format!("{}/issue/{}/changelog", self.api_base, issue_key);
         let page_size: u32 = 100;
         let mut start_at: u32 = 0;
-        let mut out: Vec<Value> = Vec::new();
+        let mut out: Vec<ChangelogEntry> = Vec::new();
 
         loop {
             let response = self
@@ -244,7 +245,9 @@ impl JiraApiClient {
             let data = Self::handle_response(response, Some(issue_key)).await?;
 
             if let Some(values) = data["values"].as_array() {
-                out.extend(values.iter().cloned());
+                for value in values {
+                    out.push(ChangelogEntry::from_value(value.clone())?);
+                }
             }
 
             let is_last = data["isLast"].as_bool().unwrap_or(true);
@@ -277,10 +280,7 @@ mod tests {
             .await
             .expect("fetch_changelog");
 
-        let ids: Vec<&str> = entries
-            .iter()
-            .map(|e| e["id"].as_str().unwrap_or(""))
-            .collect();
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(
             ids,
             vec!["1", "2", "3", "4", "5"],

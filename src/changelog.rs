@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::error::Result;
+use crate::issue::ChangelogEntry;
 
 /// Lightweight reference passed into the main markdown composer so the main
 /// `{KEY}.md` file can cross-link to the sibling changelog file.
@@ -15,27 +16,24 @@ pub struct ChangelogSummary {
     pub entry_count: usize,
 }
 
+/// Count the number of bullet rows that would be rendered (one per field
+/// change across all entries). Useful for populating [`ChangelogSummary`].
+pub fn row_count(entries: &[ChangelogEntry]) -> usize {
+    entries.iter().map(|e| e.items.len()).sum()
+}
+
 /// Render the full `{KEY}.changelog.md` file body.
 ///
 /// Returns YAML frontmatter (`key`, `summary`, `issue_file`, `entries`, `generated`),
 /// a `# {KEY} Changelog` heading, and one bullet row per field change, oldest-first.
-/// Count the number of bullet rows that would be rendered (one per field
-/// change across all entries). Useful for populating [`ChangelogSummary`].
-pub fn row_count(entries: &[Value]) -> usize {
-    entries
-        .iter()
-        .map(|e| e["items"].as_array().map(|a| a.len()).unwrap_or(0))
-        .sum()
-}
-
 pub fn render_changelog_file(
     issue_key: &str,
     summary: &str,
-    entries: &[Value],
+    entries: &[ChangelogEntry],
     generated_at: DateTime<Utc>,
 ) -> String {
-    let mut sorted: Vec<&Value> = entries.iter().collect();
-    sorted.sort_by_key(|e| parse_created(e["created"].as_str().unwrap_or("")));
+    let mut sorted: Vec<&ChangelogEntry> = entries.iter().collect();
+    sorted.sort_by_key(|e| parse_created(e.created.as_str()));
 
     let row_count: usize = row_count(entries);
 
@@ -53,12 +51,12 @@ pub fn render_changelog_file(
     out.push_str(&format!("# {} Changelog\n\n", issue_key));
 
     for entry in sorted {
-        let timestamp = normalize_timestamp(entry["created"].as_str().unwrap_or(""));
-        let author = entry["author"]["displayName"].as_str().unwrap_or("");
-        for item in entry["items"].as_array().into_iter().flatten() {
-            let field = item["field"].as_str().unwrap_or("");
-            let from = display_value(&item["fromString"]);
-            let to = display_value(&item["toString"]);
+        let timestamp = normalize_timestamp(entry.created.as_str());
+        let author = entry.author.as_str();
+        for item in entry.items.iter() {
+            let field = item.field.as_str();
+            let from = display_value(item.from_string.as_deref());
+            let to = display_value(item.to_string.as_deref());
             out.push_str(&format!(
                 "- {} — {} — **{}**: {} → {}\n",
                 timestamp, author, field, from, to
@@ -82,7 +80,7 @@ pub fn render_changelog_file(
 pub async fn write_artifacts(
     issue_key: &str,
     summary: &str,
-    entries: &[Value],
+    entries: &[ChangelogEntry],
     output_dir: &Path,
     include_json: bool,
 ) -> Result<ChangelogSummary> {
@@ -92,7 +90,12 @@ pub async fn write_artifacts(
 
     if include_json {
         let json_path = output_dir.join(format!("{}.changelog.json", issue_key));
-        let json_str = serde_json::to_string_pretty(entries)?;
+        // ADR-0002: serialize the retained raw payloads so the `.changelog.json`
+        // artifact is byte-identical to what Jira returned. Serializing the
+        // typed struct would drop auxiliary keys (e.g. `historyMetadata`,
+        // `fieldId`, `fieldtype`, `from`, `to`) and reorder fields.
+        let raws: Vec<&Value> = entries.iter().map(|e| &e.raw).collect();
+        let json_str = serde_json::to_string_pretty(&raws)?;
         tokio::fs::write(&json_path, json_str).await?;
     }
 
@@ -111,9 +114,12 @@ fn yaml_scalar(s: &str) -> String {
     }
 }
 
-fn display_value(v: &Value) -> &str {
-    match v.as_str() {
-        Some(s) if !s.is_empty() => s,
+/// Map an `Option<&str>` field value (from `ChangelogItem::from_string` /
+/// `to_string`) to the renderer's display form: `None` or empty string → `∅`,
+/// otherwise the string itself.
+fn display_value(s: Option<&str>) -> &str {
+    match s {
+        Some(v) if !v.is_empty() => v,
         _ => "∅",
     }
 }
@@ -137,6 +143,7 @@ fn normalize_timestamp(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::issue::ChangelogItem;
     use serde_json::json;
 
     fn fixed_generated_at() -> DateTime<Utc> {
@@ -148,30 +155,60 @@ mod tests {
     #[test]
     fn renders_null_or_empty_field_strings_as_empty_set_symbol() {
         let entries = vec![
-            json!({
-                "id": "1",
-                "author": { "displayName": "U" },
-                "created": "2024-01-01T00:00:00.000+0000",
-                "items": [
-                    { "field": "assignee", "fromString": null, "toString": "Jane" }
-                ]
-            }),
-            json!({
-                "id": "2",
-                "author": { "displayName": "U" },
-                "created": "2024-01-02T00:00:00.000+0000",
-                "items": [
-                    { "field": "assignee", "fromString": "Jane", "toString": null }
-                ]
-            }),
-            json!({
-                "id": "3",
-                "author": { "displayName": "U" },
-                "created": "2024-01-03T00:00:00.000+0000",
-                "items": [
-                    { "field": "labels", "fromString": "", "toString": "" }
-                ]
-            }),
+            ChangelogEntry {
+                raw: json!({
+                    "id": "1",
+                    "author": { "displayName": "U" },
+                    "created": "2024-01-01T00:00:00.000+0000",
+                    "items": [
+                        { "field": "assignee", "fromString": null, "toString": "Jane" }
+                    ]
+                }),
+                id: "1".into(),
+                author: "U".into(),
+                created: "2024-01-01T00:00:00.000+0000".into(),
+                items: vec![ChangelogItem {
+                    field: "assignee".into(),
+                    from_string: None,
+                    to_string: Some("Jane".into()),
+                }],
+            },
+            ChangelogEntry {
+                raw: json!({
+                    "id": "2",
+                    "author": { "displayName": "U" },
+                    "created": "2024-01-02T00:00:00.000+0000",
+                    "items": [
+                        { "field": "assignee", "fromString": "Jane", "toString": null }
+                    ]
+                }),
+                id: "2".into(),
+                author: "U".into(),
+                created: "2024-01-02T00:00:00.000+0000".into(),
+                items: vec![ChangelogItem {
+                    field: "assignee".into(),
+                    from_string: Some("Jane".into()),
+                    to_string: None,
+                }],
+            },
+            ChangelogEntry {
+                raw: json!({
+                    "id": "3",
+                    "author": { "displayName": "U" },
+                    "created": "2024-01-03T00:00:00.000+0000",
+                    "items": [
+                        { "field": "labels", "fromString": "", "toString": "" }
+                    ]
+                }),
+                id: "3".into(),
+                author: "U".into(),
+                created: "2024-01-03T00:00:00.000+0000".into(),
+                items: vec![ChangelogItem {
+                    field: "labels".into(),
+                    from_string: Some("".into()),
+                    to_string: Some("".into()),
+                }],
+            },
         ];
 
         let output = render_changelog_file("K", "S", &entries, fixed_generated_at());
@@ -196,18 +233,38 @@ mod tests {
     #[test]
     fn sorts_entries_oldest_first_regardless_of_input_order() {
         let entries = vec![
-            json!({
-                "id": "2",
-                "author": { "displayName": "Later User" },
-                "created": "2024-03-01T00:00:00.000+0000",
-                "items": [ { "field": "status", "fromString": "A", "toString": "B" } ]
-            }),
-            json!({
-                "id": "1",
-                "author": { "displayName": "Earlier User" },
-                "created": "2024-01-01T00:00:00.000+0000",
-                "items": [ { "field": "status", "fromString": "X", "toString": "Y" } ]
-            }),
+            ChangelogEntry {
+                raw: json!({
+                    "id": "2",
+                    "author": { "displayName": "Later User" },
+                    "created": "2024-03-01T00:00:00.000+0000",
+                    "items": [ { "field": "status", "fromString": "A", "toString": "B" } ]
+                }),
+                id: "2".into(),
+                author: "Later User".into(),
+                created: "2024-03-01T00:00:00.000+0000".into(),
+                items: vec![ChangelogItem {
+                    field: "status".into(),
+                    from_string: Some("A".into()),
+                    to_string: Some("B".into()),
+                }],
+            },
+            ChangelogEntry {
+                raw: json!({
+                    "id": "1",
+                    "author": { "displayName": "Earlier User" },
+                    "created": "2024-01-01T00:00:00.000+0000",
+                    "items": [ { "field": "status", "fromString": "X", "toString": "Y" } ]
+                }),
+                id: "1".into(),
+                author: "Earlier User".into(),
+                created: "2024-01-01T00:00:00.000+0000".into(),
+                items: vec![ChangelogItem {
+                    field: "status".into(),
+                    from_string: Some("X".into()),
+                    to_string: Some("Y".into()),
+                }],
+            },
         ];
 
         let output = render_changelog_file("K", "S", &entries, fixed_generated_at());
@@ -230,15 +287,32 @@ mod tests {
 
     #[test]
     fn flattens_multi_item_entry_to_one_row_per_field_change() {
-        let entries = vec![json!({
-            "id": "2",
-            "author": { "displayName": "Bob Jones" },
-            "created": "2024-02-01T09:00:00.000+0000",
-            "items": [
-                { "field": "status", "fromString": "To Do", "toString": "In Progress" },
-                { "field": "assignee", "fromString": null, "toString": "Bob Jones" }
-            ]
-        })];
+        let entries = vec![ChangelogEntry {
+            raw: json!({
+                "id": "2",
+                "author": { "displayName": "Bob Jones" },
+                "created": "2024-02-01T09:00:00.000+0000",
+                "items": [
+                    { "field": "status", "fromString": "To Do", "toString": "In Progress" },
+                    { "field": "assignee", "fromString": null, "toString": "Bob Jones" }
+                ]
+            }),
+            id: "2".into(),
+            author: "Bob Jones".into(),
+            created: "2024-02-01T09:00:00.000+0000".into(),
+            items: vec![
+                ChangelogItem {
+                    field: "status".into(),
+                    from_string: Some("To Do".into()),
+                    to_string: Some("In Progress".into()),
+                },
+                ChangelogItem {
+                    field: "assignee".into(),
+                    from_string: None,
+                    to_string: Some("Bob Jones".into()),
+                },
+            ],
+        }];
 
         let output =
             render_changelog_file("PROJ-1", "Multi-field save", &entries, fixed_generated_at());
@@ -257,14 +331,24 @@ mod tests {
 
     #[test]
     fn renders_single_field_change_as_compact_bullet_line() {
-        let entries = vec![json!({
-            "id": "1",
-            "author": { "displayName": "Jane Smith" },
-            "created": "2024-01-20T14:32:17.000+0000",
-            "items": [
-                { "field": "status", "fromString": "To Do", "toString": "In Progress" }
-            ]
-        })];
+        let entries = vec![ChangelogEntry {
+            raw: json!({
+                "id": "1",
+                "author": { "displayName": "Jane Smith" },
+                "created": "2024-01-20T14:32:17.000+0000",
+                "items": [
+                    { "field": "status", "fromString": "To Do", "toString": "In Progress" }
+                ]
+            }),
+            id: "1".into(),
+            author: "Jane Smith".into(),
+            created: "2024-01-20T14:32:17.000+0000".into(),
+            items: vec![ChangelogItem {
+                field: "status".into(),
+                from_string: Some("To Do".into()),
+                to_string: Some("In Progress".into()),
+            }],
+        }];
 
         let output =
             render_changelog_file("PROJ-123", "Implement auth", &entries, fixed_generated_at());
