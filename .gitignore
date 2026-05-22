@@ -1,2 +1,11 @@
 /target
 .env
+
+# Local QA harness — large frozen pre-refactor binary + per-ticket baseline
+# export artifacts + verify.py. Recreated locally by the maintainer; not part
+# of the source distribution.
+/.goal-baseline/
+
+# GoalBuddy planning boards — session-local task state with ticket-specific
+# references. Kept out of git for now.
+/docs/goals/
