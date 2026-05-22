@@ -783,7 +783,9 @@ impl MarkdownConverter {
             }
         };
 
-        let mut groups: HashMap<String, Vec<&Value>> = HashMap::new();
+        // First-occurrence order of link-type labels keeps the rendered
+        // sections deterministic (a HashMap here shuffled them per run).
+        let mut groups: Vec<(String, Vec<&Value>)> = Vec::new();
         for link in links {
             let link_type = &link["type"];
             let (label, issue) =
@@ -796,7 +798,11 @@ impl MarkdownConverter {
                 } else {
                     continue;
                 };
-            groups.entry(label).or_default().push(issue);
+            if let Some(entry) = groups.iter_mut().find(|(l, _)| l == &label) {
+                entry.1.push(issue);
+            } else {
+                groups.push((label, vec![issue]));
+            }
         }
 
         for (label, issues) in &groups {
@@ -1183,7 +1189,29 @@ impl MarkdownConverter {
         if !downloaded.is_empty() {
             lines.push("## Attachments".into());
             lines.push(String::new());
-            for att in downloaded {
+            // Render in Jira's attachment-array order: `downloaded` arrives in
+            // concurrent-download completion order, which varies per run.
+            let jira_order: HashMap<&str, usize> = issue_data["fields"]["attachment"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .enumerate()
+                        .filter_map(|(i, a)| a["id"].as_str().map(|id| (id, i)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut ordered: Vec<&DownloadedAttachment> = downloaded.iter().collect();
+            ordered.sort_by(|a, b| {
+                let rank = |att: &DownloadedAttachment| {
+                    att.attachment_id
+                        .as_deref()
+                        .and_then(|id| jira_order.get(id))
+                        .copied()
+                        .unwrap_or(usize::MAX)
+                };
+                rank(a).cmp(&rank(b)).then_with(|| a.filename.cmp(&b.filename))
+            });
+            for att in ordered {
                 let encoded = url_encode(&att.filename);
                 if att.mime_type.starts_with("image/") {
                     lines.push(format!("- ![{}]({})", att.filename, encoded));
