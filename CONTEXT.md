@@ -17,7 +17,7 @@ A free-text user comment posted on an **Issue**. Distinct from a **Changelog** e
 _Avoid_: Note.
 
 **Worklog**:
-A time-tracking entry logged against an **Issue**. Not currently exported; explicitly out of scope for the changelog feature.
+A time-tracking entry logged against an **Issue** (author, time spent, date, optional comment). Exported as part of the Issue's content, but out of scope for the **Changelog** feature — a worklog records logged time, a changelog entry records a field change.
 
 ## Relationships
 
