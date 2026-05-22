@@ -1,7 +1,11 @@
 //! Render Jira changelog (audit trail of field changes) to Markdown.
 
+use std::path::Path;
+
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+
+use crate::error::Result;
 
 /// Lightweight reference passed into the main markdown composer so the main
 /// `{KEY}.md` file can cross-link to the sibling changelog file.
@@ -62,6 +66,40 @@ pub fn render_changelog_file(
         }
     }
     out
+}
+
+/// Render and write the on-disk changelog artifacts for an issue:
+/// `{KEY}.changelog.md` and, when `include_json` is set, `{KEY}.changelog.json`.
+///
+/// This is the single owner of the changelog *write* sequence — both the
+/// standard single-export path and the incremental-backfill path call it, so
+/// the artifact shape and the JSON-write error handling can no longer drift.
+/// Fetching the entries stays with the caller: the two paths have
+/// intentionally different fetch-failure policies (a full export treats a
+/// fetch failure as an empty changelog, whereas backfill skips entirely so a
+/// transient failure does not write an empty file and suppress a later
+/// backfill).
+pub async fn write_artifacts(
+    issue_key: &str,
+    summary: &str,
+    entries: &[Value],
+    output_dir: &Path,
+    include_json: bool,
+) -> Result<ChangelogSummary> {
+    let body = render_changelog_file(issue_key, summary, entries, Utc::now());
+    let md_path = output_dir.join(format!("{}.changelog.md", issue_key));
+    tokio::fs::write(&md_path, body).await?;
+
+    if include_json {
+        let json_path = output_dir.join(format!("{}.changelog.json", issue_key));
+        let json_str = serde_json::to_string_pretty(entries)?;
+        tokio::fs::write(&json_path, json_str).await?;
+    }
+
+    Ok(ChangelogSummary {
+        file_name: format!("{}.changelog.md", issue_key),
+        entry_count: row_count(entries),
+    })
 }
 
 fn yaml_scalar(s: &str) -> String {

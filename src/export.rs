@@ -9,7 +9,6 @@ use crate::error::Result;
 use crate::field_cache::FieldMetadataCache;
 use crate::jira_client::JiraApiClient;
 use crate::markdown::MarkdownConverter;
-use chrono::Utc;
 use log::{info, warn};
 use serde_json::Value;
 
@@ -124,24 +123,30 @@ pub async fn perform_export_with_options(
         }
     };
 
-    // Fetch changelog up-front (opt-in) so the main markdown can cross-reference it
-    let changelog_entries: Option<Vec<Value>> = if options.include_changelog {
-        match api_client.fetch_changelog(issue_key).await {
-            Ok(e) => Some(e),
+    // Fetch + write the changelog artifacts up-front (opt-in); the returned
+    // summary lets the main markdown cross-reference the sibling changelog
+    // file. A fetch failure here degrades to an empty changelog.
+    let changelog_summary: Option<changelog::ChangelogSummary> = if options.include_changelog {
+        let entries = match api_client.fetch_changelog(issue_key).await {
+            Ok(e) => e,
             Err(e) => {
                 warn!("Failed to fetch changelog for {}: {}", issue_key, e);
-                Some(Vec::new())
+                Vec::new()
             }
-        }
+        };
+        Some(
+            changelog::write_artifacts(
+                issue_key,
+                &issue.summary,
+                &entries,
+                output_path,
+                options.include_json,
+            )
+            .await?,
+        )
     } else {
         None
     };
-    let changelog_summary = changelog_entries.as_ref().map(|entries| {
-        crate::changelog::ChangelogSummary {
-            file_name: format!("{}.changelog.md", issue_key),
-            entry_count: crate::changelog::row_count(entries),
-        }
-    });
 
     // Convert to Markdown
     let mut converter = MarkdownConverter::new(&api_client.base_url, &api_client.domain);
@@ -171,20 +176,6 @@ pub async fn perform_export_with_options(
     // Write Markdown
     let md_file = output_path.join(format!("{}.md", issue_key));
     tokio::fs::write(&md_file, markdown_content).await?;
-
-    // Write changelog artifacts (opt-in)
-    if let Some(entries) = changelog_entries {
-        let body =
-            changelog::render_changelog_file(issue_key, &issue.summary, &entries, Utc::now());
-        let changelog_md = output_path.join(format!("{}.changelog.md", issue_key));
-        tokio::fs::write(&changelog_md, body).await?;
-
-        if options.include_json {
-            let changelog_json = output_path.join(format!("{}.changelog.json", issue_key));
-            let json_str = serde_json::to_string_pretty(&entries)?;
-            tokio::fs::write(&changelog_json, json_str).await?;
-        }
-    }
 
     Ok(output_path.to_path_buf())
 }

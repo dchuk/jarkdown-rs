@@ -356,22 +356,14 @@ async fn backfill_changelog(
         log::warn!("Backfill: failed to create {:?}: {}", output_path, e);
         return;
     }
-    let body = changelog::render_changelog_file(issue_key, &issue.summary, &entries, Utc::now());
-    let md_path = output_path.join(format!("{}.changelog.md", issue_key));
-    if let Err(e) = tokio::fs::write(&md_path, body).await {
-        log::warn!("Backfill: failed to write {:?}: {}", md_path, e);
-        return;
-    }
-    info!(
-        "Backfilled changelog for {} ({} rows)",
-        issue_key,
-        changelog::row_count(&entries)
-    );
-    if include_json {
-        let json_path = output_path.join(format!("{}.changelog.json", issue_key));
-        if let Ok(s) = serde_json::to_string_pretty(&entries) {
-            let _ = tokio::fs::write(&json_path, s).await;
-        }
+    match changelog::write_artifacts(issue_key, &issue.summary, &entries, output_path, include_json)
+        .await
+    {
+        Ok(summary) => info!(
+            "Backfilled changelog for {} ({} rows)",
+            issue_key, summary.entry_count
+        ),
+        Err(e) => log::warn!("Backfill: failed to write changelog for {}: {}", issue_key, e),
     }
 }
 
