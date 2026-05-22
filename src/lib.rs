@@ -54,7 +54,7 @@ pub use hierarchy::{HierarchyExporter, HierarchyOptions, IssueNode};
 pub use issue::{ChangelogEntry, ChangelogItem, Comment, Issue, IssueSearchResult, RichText};
 pub use jira_client::JiraApiClient;
 pub use manifest::Manifest;
-pub use markdown::MarkdownConverter;
+pub use markdown::{compose, AttachmentIndex, CustomFieldMetadata, RenderContext};
 pub use retry::RetryConfig;
 
 use std::path::{Path, PathBuf};

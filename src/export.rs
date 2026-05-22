@@ -2,13 +2,15 @@
 
 use std::path::{Path, PathBuf};
 
+use std::collections::HashMap;
+
 use crate::attachment::AttachmentHandler;
 use crate::changelog;
 use crate::config::ConfigManager;
 use crate::error::Result;
 use crate::field_cache::FieldMetadataCache;
 use crate::jira_client::JiraApiClient;
-use crate::markdown::MarkdownConverter;
+use crate::markdown::{compose, AttachmentIndex, CustomFieldMetadata, RenderContext};
 use log::{info, warn};
 use serde_json::Value;
 
@@ -100,8 +102,8 @@ pub async fn perform_export_with_options(
         config_manager.get_field_filter(options.include_fields, options.exclude_fields);
 
     // Discover child issues for Epics (via JQL) and Ideas (via issue links).
-    // `compose_markdown`'s child-issue section still reads raw `Value`s, so
-    // search hits are unwrapped back to their `raw` payloads here.
+    // The child-issue section still reads raw `Value`s, so search hits are
+    // unwrapped back to their `raw` payloads here.
     let child_issues: Vec<Value> = {
         if issue.issuetype.name == "Epic" {
             // Look up the "Epic Link" field ID for JQL, and also query by parent
@@ -148,23 +150,41 @@ pub async fn perform_export_with_options(
         None
     };
 
-    // Convert to Markdown
-    let mut converter = MarkdownConverter::new(&api_client.base_url, &api_client.domain);
-    let mut cache_opt = Some(field_cache);
-    let filter_opt = Some(field_filter);
-    let markdown_content = converter.compose_markdown(
-        &issue,
-        &downloaded,
-        if options.no_attachments {
-            &attachments
-        } else {
-            &[]
-        },
-        &mut cache_opt,
-        &filter_opt,
-        &child_issues,
-        changelog_summary.as_ref(),
-    );
+    // Pre-resolve custom-field metadata before constructing `RenderContext` —
+    // this is the only place `&mut FieldMetadataCache` is touched, so the
+    // markdown layer can stay purely read-only.
+    let mut names: HashMap<String, String> = HashMap::new();
+    let mut schemas: HashMap<String, Value> = HashMap::new();
+    if let Some(fields) = issue.raw.get("fields").and_then(|v| v.as_object()) {
+        for key in fields.keys().filter(|k| k.starts_with("customfield_")) {
+            names.insert(key.clone(), field_cache.get_field_name(key));
+            schemas.insert(key.clone(), field_cache.get_field_schema(key));
+        }
+    }
+    let field_metadata = CustomFieldMetadata { names, schemas };
+
+    // Build the attachment lookup index once for the render.
+    let skipped_slice: &[Value] = if options.no_attachments {
+        &attachments
+    } else {
+        &[]
+    };
+    let attachments_idx = AttachmentIndex::build(&downloaded, skipped_slice);
+
+    // Convert to Markdown via the pure `compose(&ctx)` function.
+    let ctx = RenderContext {
+        issue: &issue,
+        downloaded: &downloaded,
+        skipped_attachments: skipped_slice,
+        attachments: attachments_idx,
+        field_metadata: &field_metadata,
+        field_filter: &field_filter,
+        child_issues: &child_issues,
+        changelog_summary: changelog_summary.as_ref(),
+        base_url: &api_client.base_url,
+        domain: &api_client.domain,
+    };
+    let markdown_content = compose(&ctx);
 
     // Write raw JSON (opt-in)
     if options.include_json {
