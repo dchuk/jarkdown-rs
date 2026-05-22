@@ -104,6 +104,9 @@ mod tests {
     /// [`compose`] directly via a literal [`RenderContext`].
     #[test]
     fn skipped_attachments_render_names_and_source_urls_without_local_placeholders() {
+        use crate::issue::{
+            Progress, Project, TimeTracking, Votes, Watches, WorklogPage,
+        };
         let issue_data = json!({
             "key": "K1",
             "renderedFields": {},
@@ -158,11 +161,17 @@ mod tests {
             .unwrap()
             .clone();
 
+        // NOTE: this literal `Issue` had to be expanded with the new typed
+        // fields added in issue #13 — purely a mechanical compile fix; no
+        // behavior change to this regression test.
         let issue = Issue {
             raw: issue_data,
             key: "K1".to_string(),
             summary: "Attachment issue".to_string(),
+            created: String::new(),
             updated: String::new(),
+            duedate: None,
+            resolutiondate: None,
             issuetype: IssueType {
                 name: "Task".to_string(),
             },
@@ -170,13 +179,39 @@ mod tests {
                 name: "Open".to_string(),
                 category: Some("To Do".to_string()),
             },
+            priority: None,
+            resolution: None,
+            project: Project {
+                name: "Project".to_string(),
+                key: "PROJ".to_string(),
+            },
             assignee: None,
+            reporter: None,
+            creator: None,
+            labels: Vec::new(),
+            components: Vec::new(),
+            versions: Vec::new(),
+            fix_versions: Vec::new(),
+            timetracking: TimeTracking {
+                original_estimate: None,
+                remaining_estimate: None,
+                time_spent: None,
+            },
+            progress: Progress { percent: 0 },
+            aggregateprogress: Progress { percent: 0 },
+            votes: Votes { votes: 0 },
+            watches: Watches { watch_count: 0 },
+            environment: RichText::Empty,
             description: RichText::Empty,
             comments: Vec::new(),
             attachments: skipped.clone(),
             issuelinks: Vec::new(),
             parent: None,
             subtasks: Vec::new(),
+            worklog: WorklogPage {
+                total: 0,
+                entries: Vec::new(),
+            },
         };
         let field_metadata = CustomFieldMetadata::empty();
         let field_filter = FieldFilter::default();

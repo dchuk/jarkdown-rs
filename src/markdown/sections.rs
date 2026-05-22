@@ -12,14 +12,14 @@ use urlencoding::encode as url_encode;
 
 use crate::attachment::DownloadedAttachment;
 use crate::custom_field::CustomFieldRenderer;
-use crate::issue::RichText;
+use crate::issue::{Issue, RichText};
 use crate::markdown::adf::{adf_to_plain_text, capitalize, parse_adf_to_markdown};
 use crate::markdown::attachments::replace_attachment_links;
 use crate::markdown::html::convert_html_to_markdown;
 use crate::markdown::RenderContext;
 
 pub(crate) fn frontmatter(ctx: &RenderContext<'_>) -> Vec<String> {
-    let metadata = generate_metadata(&ctx.issue.raw);
+    let metadata = generate_metadata(ctx.issue);
     let yaml_str = serde_yaml::to_string(&metadata).unwrap_or_default();
 
     let mut lines = Vec::new();
@@ -34,10 +34,16 @@ pub(crate) fn frontmatter(ctx: &RenderContext<'_>) -> Vec<String> {
 }
 
 pub(crate) fn title(ctx: &RenderContext<'_>) -> Vec<String> {
-    let key = ctx.issue.raw["key"].as_str().unwrap_or("UNKNOWN");
-    let summary = ctx.issue.raw["fields"]["summary"]
-        .as_str()
-        .unwrap_or("No Summary");
+    let key = if ctx.issue.key.is_empty() {
+        "UNKNOWN"
+    } else {
+        ctx.issue.key.as_str()
+    };
+    let summary = if ctx.issue.summary.is_empty() {
+        "No Summary"
+    } else {
+        ctx.issue.summary.as_str()
+    };
     vec![
         format!("# [{}]({}/browse/{}): {}", key, ctx.base_url, key, summary),
         String::new(),
@@ -49,70 +55,48 @@ pub(crate) fn description(ctx: &RenderContext<'_>) -> Vec<String> {
     lines.push("## Description".into());
     lines.push(String::new());
 
-    let issue_data = &ctx.issue.raw;
-    let rendered_desc = issue_data["renderedFields"]["description"].as_str();
-    if let Some(html) = rendered_desc {
-        if !html.is_empty() {
+    match &ctx.issue.description {
+        RichText::Html(html) => {
             let md = convert_html_to_markdown(html);
             let md = replace_attachment_links(&md, ctx.downloaded, ctx.domain);
             lines.push(md);
-        } else {
-            lines.push("*No description provided*".into());
         }
-    } else {
-        let raw_desc = &issue_data["fields"]["description"];
-        if raw_desc.is_object() {
-            let md = parse_adf_to_markdown(raw_desc, &ctx.attachments);
+        RichText::Adf(adf) => {
+            let md = parse_adf_to_markdown(adf, &ctx.attachments);
             let md = replace_attachment_links(&md, ctx.downloaded, ctx.domain);
             lines.push(md);
-        } else if let Some(s) = raw_desc.as_str() {
+        }
+        RichText::Plain(s) => {
             let md = replace_attachment_links(s, ctx.downloaded, ctx.domain);
             lines.push(md);
-        } else {
-            lines.push("*No description provided*".into());
         }
+        RichText::Empty => lines.push("*No description provided*".into()),
     }
     lines.push(String::new());
     lines
 }
 
 pub(crate) fn environment(ctx: &RenderContext<'_>) -> Vec<String> {
-    let issue_data = &ctx.issue.raw;
     let mut lines = vec!["## Environment".into(), String::new()];
-    let rendered_env = issue_data["renderedFields"]["environment"].as_str();
-    if let Some(html) = rendered_env {
-        if !html.is_empty() {
-            lines.push(convert_html_to_markdown(html));
-        } else {
-            lines.push("None".into());
-        }
-    } else {
-        let raw_env = &issue_data["fields"]["environment"];
-        if raw_env.is_object() {
-            lines.push(parse_adf_to_markdown(raw_env, &ctx.attachments));
-        } else if let Some(s) = raw_env.as_str() {
-            lines.push(s.to_string());
-        } else {
-            lines.push("None".into());
-        }
+    match &ctx.issue.environment {
+        RichText::Html(html) => lines.push(convert_html_to_markdown(html)),
+        RichText::Adf(adf) => lines.push(parse_adf_to_markdown(adf, &ctx.attachments)),
+        RichText::Plain(s) => lines.push(s.clone()),
+        RichText::Empty => lines.push("None".into()),
     }
     lines.push(String::new());
     lines
 }
 
 pub(crate) fn linked_issues(ctx: &RenderContext<'_>) -> Vec<String> {
-    let issue_data = &ctx.issue.raw;
     let mut lines = vec!["## Linked Issues".into(), String::new()];
-    let issuelinks = issue_data["fields"]["issuelinks"].as_array();
+    let links = &ctx.issue.issuelinks;
 
-    let links = match issuelinks {
-        Some(l) if !l.is_empty() => l,
-        _ => {
-            lines.push("None".into());
-            lines.push(String::new());
-            return lines;
-        }
-    };
+    if links.is_empty() {
+        lines.push("None".into());
+        lines.push(String::new());
+        return lines;
+    }
 
     // First-occurrence order of link-type labels keeps the rendered
     // sections deterministic (a HashMap here shuffled them per run).
@@ -154,26 +138,24 @@ pub(crate) fn linked_issues(ctx: &RenderContext<'_>) -> Vec<String> {
 }
 
 pub(crate) fn subtasks(ctx: &RenderContext<'_>) -> Vec<String> {
-    let issue_data = &ctx.issue.raw;
     let mut lines = vec!["## Subtasks".into(), String::new()];
-    let subtasks = issue_data["fields"]["subtasks"].as_array();
-
-    match subtasks {
-        Some(s) if !s.is_empty() => {
-            for subtask in s {
-                let key = subtask["key"].as_str().unwrap_or("UNKNOWN");
-                let summary = subtask["fields"]["summary"].as_str().unwrap_or("");
-                let status = subtask["fields"]["status"]["name"].as_str().unwrap_or("");
-                let itype = subtask["fields"]["issuetype"]["name"]
-                    .as_str()
-                    .unwrap_or("");
-                lines.push(format!(
-                    "- [{}]({}/browse/{}): {} ({}) \u{2014} {}",
-                    key, ctx.base_url, key, summary, status, itype
-                ));
-            }
+    let subtasks = &ctx.issue.subtasks;
+    if subtasks.is_empty() {
+        lines.push("None".into());
+    } else {
+        // Per-entry walks STAY raw — `subtasks: Vec<Value>` per ADR-0002.
+        for subtask in subtasks {
+            let key = subtask["key"].as_str().unwrap_or("UNKNOWN");
+            let summary = subtask["fields"]["summary"].as_str().unwrap_or("");
+            let status = subtask["fields"]["status"]["name"].as_str().unwrap_or("");
+            let itype = subtask["fields"]["issuetype"]["name"]
+                .as_str()
+                .unwrap_or("");
+            lines.push(format!(
+                "- [{}]({}/browse/{}): {} ({}) \u{2014} {}",
+                key, ctx.base_url, key, summary, status, itype
+            ));
         }
-        _ => lines.push("None".into()),
     }
     lines.push(String::new());
     lines
@@ -212,27 +194,19 @@ pub(crate) fn child_issues(ctx: &RenderContext<'_>) -> Vec<String> {
 }
 
 pub(crate) fn worklogs(ctx: &RenderContext<'_>) -> Vec<String> {
-    let issue_data = &ctx.issue.raw;
-    let fields = &issue_data["fields"];
-    let worklog_data = &fields["worklog"];
-    let worklogs = worklog_data["worklogs"].as_array();
-    let total = worklog_data["total"].as_u64().unwrap_or(0);
+    let worklog = &ctx.issue.worklog;
+    let wl = &worklog.entries;
+    let total = worklog.total;
 
     let mut lines = vec!["## Worklogs".into(), String::new()];
 
-    let wl = match worklogs {
-        Some(w) if !w.is_empty() => w,
-        _ => {
-            lines.push("None".into());
-            lines.push(String::new());
-            return lines;
-        }
-    };
+    if wl.is_empty() {
+        lines.push("None".into());
+        lines.push(String::new());
+        return lines;
+    }
 
-    let total_seconds: u64 = wl
-        .iter()
-        .map(|e| e["timeSpentSeconds"].as_u64().unwrap_or(0))
-        .sum();
+    let total_seconds: u64 = wl.iter().map(|e| e.time_spent_seconds).sum();
     lines.push(format!(
         "**Total Time Logged:** {}",
         format_time(total_seconds)
@@ -252,18 +226,24 @@ pub(crate) fn worklogs(ctx: &RenderContext<'_>) -> Vec<String> {
     lines.push("|--------|-----------|------|---------|".into());
 
     for entry in wl {
-        let author = entry["author"]["displayName"].as_str().unwrap_or("Unknown");
-        let time_spent = entry["timeSpent"].as_str().unwrap_or("");
-        let started = entry["started"].as_str().unwrap_or("");
+        // Preserve the "Unknown" fallback when an author's display name is
+        // missing — some legacy worklogs lack `author.displayName`.
+        let author = if entry.author.is_empty() {
+            "Unknown"
+        } else {
+            entry.author.as_str()
+        };
+        let started = entry.started.as_str();
         let date = if started.len() >= 10 {
             &started[..10]
         } else {
             started
         };
-        let comment = adf_to_plain_text(&entry["comment"]).replace('|', "\\|");
+        // `entry.comment` STAYS `Value` — handed straight to `adf_to_plain_text`.
+        let comment = adf_to_plain_text(&entry.comment).replace('|', "\\|");
         lines.push(format!(
             "| {} | {} | {} | {} |",
-            author, time_spent, date, comment
+            author, entry.time_spent, date, comment
         ));
     }
     lines.push(String::new());
@@ -393,7 +373,6 @@ pub(crate) fn changelog(ctx: &RenderContext<'_>) -> Vec<String> {
 }
 
 pub(crate) fn attachments(ctx: &RenderContext<'_>) -> Vec<String> {
-    let issue_data = &ctx.issue.raw;
     let downloaded = ctx.downloaded;
     let skipped_attachments = ctx.skipped_attachments;
 
@@ -403,15 +382,15 @@ pub(crate) fn attachments(ctx: &RenderContext<'_>) -> Vec<String> {
         lines.push(String::new());
         // Render in Jira's attachment-array order: `downloaded` arrives in
         // concurrent-download completion order, which varies per run.
-        let jira_order: HashMap<&str, usize> = issue_data["fields"]["attachment"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .enumerate()
-                    .filter_map(|(i, a)| a["id"].as_str().map(|id| (id, i)))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Per-entry walk of `attachment` STAYS raw — `Issue.attachments:
+        // Vec<Value>` per ADR-0002.
+        let jira_order: HashMap<&str, usize> = ctx
+            .issue
+            .attachments
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| a["id"].as_str().map(|id| (id, i)))
+            .collect();
         let mut ordered: Vec<&DownloadedAttachment> = downloaded.iter().collect();
         ordered.sort_by(|a, b| {
             let rank = |att: &DownloadedAttachment| {
@@ -456,13 +435,21 @@ pub(crate) fn attachments(ctx: &RenderContext<'_>) -> Vec<String> {
 // helpers — kept private to this module
 // -----------------------------------------------------------------------------
 
-/// Generate YAML metadata mapping from raw Jira issue data.
-fn generate_metadata(issue_data: &Value) -> serde_yaml::Value {
+/// Generate YAML metadata mapping from the typed [`Issue`].
+///
+/// After issue #13, every standard field consumed here is read from the typed
+/// spine — `Issue::raw` is no longer touched for frontmatter. The
+/// `Option<String>` / empty-string distinction encodes the YAML
+/// `null`-vs-string output: `parse_string` collapses absent/null to `""`,
+/// which we surface as YAML `null`; `parse_opt_string` preserves the absent
+/// case directly.
+fn generate_metadata(issue: &Issue) -> serde_yaml::Value {
     use serde_yaml::Value as Y;
 
-    let fields = &issue_data["fields"];
     let mut map = serde_yaml::Mapping::new();
 
+    // `set_str` emits YAML `null` for `None` and a quoted/unquoted string
+    // otherwise — mirrors `set_str(Option<&str>)` exactly.
     let set_str = |map: &mut serde_yaml::Mapping, key: &str, val: Option<&str>| {
         map.insert(
             Y::String(key.into()),
@@ -473,116 +460,127 @@ fn generate_metadata(issue_data: &Value) -> serde_yaml::Value {
         );
     };
 
-    set_str(&mut map, "key", issue_data["key"].as_str());
-    set_str(&mut map, "summary", fields["summary"].as_str());
-    set_str(&mut map, "type", fields["issuetype"]["name"].as_str());
-    set_str(&mut map, "status", fields["status"]["name"].as_str());
+    // A required string field (`key`, `summary`, etc.): empty string ⇒ YAML
+    // `null`, matching the pre-#13 `as_str()` projection on a missing field.
+    fn some_if_not_empty(s: &str) -> Option<&str> {
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+
+    set_str(&mut map, "key", some_if_not_empty(&issue.key));
+    set_str(&mut map, "summary", some_if_not_empty(&issue.summary));
+    set_str(&mut map, "type", some_if_not_empty(&issue.issuetype.name));
+    set_str(&mut map, "status", some_if_not_empty(&issue.status.name));
     set_str(
         &mut map,
         "status_category",
-        fields["status"]["statusCategory"]["name"].as_str(),
+        issue.status.category.as_deref(),
     );
-    set_str(&mut map, "priority", fields["priority"]["name"].as_str());
+    set_str(
+        &mut map,
+        "priority",
+        issue.priority.as_ref().map(|p| p.name.as_str()),
+    );
     set_str(
         &mut map,
         "resolution",
-        fields["resolution"]["name"].as_str(),
+        issue.resolution.as_ref().map(|r| r.name.as_str()),
     );
-    set_str(&mut map, "project", fields["project"]["name"].as_str());
-    set_str(&mut map, "project_key", fields["project"]["key"].as_str());
+    set_str(&mut map, "project", some_if_not_empty(&issue.project.name));
+    set_str(&mut map, "project_key", some_if_not_empty(&issue.project.key));
     set_str(
         &mut map,
         "assignee",
-        fields["assignee"]["displayName"].as_str(),
+        issue.assignee.as_ref().map(|u| u.display_name.as_str()),
     );
     set_str(
         &mut map,
         "reporter",
-        fields["reporter"]["displayName"].as_str(),
+        issue.reporter.as_ref().map(|u| u.display_name.as_str()),
     );
     set_str(
         &mut map,
         "creator",
-        fields["creator"]["displayName"].as_str(),
+        issue.creator.as_ref().map(|u| u.display_name.as_str()),
     );
 
-    let labels: Vec<serde_yaml::Value> = fields["labels"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(|s| Y::String(s.into())))
-                .collect()
-        })
-        .unwrap_or_default();
+    let labels: Vec<serde_yaml::Value> = issue
+        .labels
+        .iter()
+        .map(|s| Y::String(s.clone()))
+        .collect();
     map.insert(Y::String("labels".into()), Y::Sequence(labels));
 
-    let components: Vec<serde_yaml::Value> = fields["components"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|c| c["name"].as_str().map(|s| Y::String(s.into())))
-                .collect()
-        })
-        .unwrap_or_default();
+    let components: Vec<serde_yaml::Value> = issue
+        .components
+        .iter()
+        .map(|c| Y::String(c.name.clone()))
+        .collect();
     map.insert(Y::String("components".into()), Y::Sequence(components));
 
-    set_str(&mut map, "parent_key", fields["parent"]["key"].as_str());
+    // `parent` STAYS `Option<Value>` per ADR-0002 — the renderer walks it
+    // raw here for `key` / `fields.summary`.
+    set_str(
+        &mut map,
+        "parent_key",
+        issue
+            .parent
+            .as_ref()
+            .and_then(|p| p["key"].as_str()),
+    );
     set_str(
         &mut map,
         "parent_summary",
-        fields["parent"]["fields"]["summary"].as_str(),
+        issue
+            .parent
+            .as_ref()
+            .and_then(|p| p["fields"]["summary"].as_str()),
     );
 
-    let affects: Vec<serde_yaml::Value> = fields["versions"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v["name"].as_str().map(|s| Y::String(s.into())))
-                .collect()
-        })
-        .unwrap_or_default();
+    let affects: Vec<serde_yaml::Value> = issue
+        .versions
+        .iter()
+        .map(|v| Y::String(v.name.clone()))
+        .collect();
     map.insert(Y::String("affects_versions".into()), Y::Sequence(affects));
 
-    let fix_ver: Vec<serde_yaml::Value> = fields["fixVersions"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v["name"].as_str().map(|s| Y::String(s.into())))
-                .collect()
-        })
-        .unwrap_or_default();
+    let fix_ver: Vec<serde_yaml::Value> = issue
+        .fix_versions
+        .iter()
+        .map(|v| Y::String(v.name.clone()))
+        .collect();
     map.insert(Y::String("fix_versions".into()), Y::Sequence(fix_ver));
 
-    set_str(&mut map, "created_at", fields["created"].as_str());
-    set_str(&mut map, "updated_at", fields["updated"].as_str());
-    set_str(&mut map, "resolved_at", fields["resolutiondate"].as_str());
-    set_str(&mut map, "duedate", fields["duedate"].as_str());
+    set_str(&mut map, "created_at", some_if_not_empty(&issue.created));
+    set_str(&mut map, "updated_at", some_if_not_empty(&issue.updated));
+    set_str(&mut map, "resolved_at", issue.resolutiondate.as_deref());
+    set_str(&mut map, "duedate", issue.duedate.as_deref());
 
-    let tt = &fields["timetracking"];
-    set_str(
-        &mut map,
-        "original_estimate",
-        tt["originalEstimate"].as_str(),
-    );
-    set_str(&mut map, "time_spent", tt["timeSpent"].as_str());
-    set_str(
-        &mut map,
-        "remaining_estimate",
-        tt["remainingEstimate"].as_str(),
-    );
+    let tt = &issue.timetracking;
+    set_str(&mut map, "original_estimate", tt.original_estimate.as_deref());
+    set_str(&mut map, "time_spent", tt.time_spent.as_deref());
+    set_str(&mut map, "remaining_estimate", tt.remaining_estimate.as_deref());
 
-    let progress = fields["progress"]["percent"].as_u64().unwrap_or(0);
-    let agg_progress = fields["aggregateprogress"]["percent"].as_u64().unwrap_or(0);
-    map.insert(Y::String("progress".into()), Y::Number(progress.into()));
+    map.insert(
+        Y::String("progress".into()),
+        Y::Number(issue.progress.percent.into()),
+    );
     map.insert(
         Y::String("aggregate_progress".into()),
-        Y::Number(agg_progress.into()),
+        Y::Number(issue.aggregateprogress.percent.into()),
     );
 
-    let votes = fields["votes"]["votes"].as_u64().unwrap_or(0);
-    let watches = fields["watches"]["watchCount"].as_u64().unwrap_or(0);
-    map.insert(Y::String("votes".into()), Y::Number(votes.into()));
-    map.insert(Y::String("watches".into()), Y::Number(watches.into()));
+    map.insert(
+        Y::String("votes".into()),
+        Y::Number(issue.votes.votes.into()),
+    );
+    map.insert(
+        Y::String("watches".into()),
+        Y::Number(issue.watches.watch_count.into()),
+    );
 
     Y::Mapping(map)
 }
@@ -642,7 +640,10 @@ fn format_jira_date(created: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::FieldFilter;
-    use crate::issue::{Comment, Issue, IssueType, RichText, Status};
+    use crate::issue::{
+        Comment, Issue, IssueType, NamedRef, Priority, Progress, Project, Resolution, RichText,
+        Status, TimeTracking, User, Votes, Watches, WorklogPage,
+    };
     use crate::markdown::{AttachmentIndex, CustomFieldMetadata, RenderContext};
 
     /// AC#7: a section composer built from a *literal* `RenderContext` (no
@@ -655,7 +656,10 @@ mod tests {
             raw: serde_json::Value::Null,
             key: "K1".into(),
             summary: "S".into(),
+            created: String::new(),
             updated: String::new(),
+            duedate: None,
+            resolutiondate: None,
             issuetype: IssueType {
                 name: "Task".into(),
             },
@@ -663,7 +667,29 @@ mod tests {
                 name: "Open".into(),
                 category: None,
             },
+            priority: None,
+            resolution: None,
+            project: Project {
+                name: String::new(),
+                key: String::new(),
+            },
             assignee: None,
+            reporter: None,
+            creator: None,
+            labels: Vec::new(),
+            components: Vec::new(),
+            versions: Vec::new(),
+            fix_versions: Vec::new(),
+            timetracking: TimeTracking {
+                original_estimate: None,
+                remaining_estimate: None,
+                time_spent: None,
+            },
+            progress: Progress { percent: 0 },
+            aggregateprogress: Progress { percent: 0 },
+            votes: Votes { votes: 0 },
+            watches: Watches { watch_count: 0 },
+            environment: RichText::Empty,
             description: RichText::Empty,
             comments: vec![Comment {
                 id: "1".into(),
@@ -675,6 +701,10 @@ mod tests {
             issuelinks: Vec::new(),
             parent: None,
             subtasks: Vec::new(),
+            worklog: WorklogPage {
+                total: 0,
+                entries: Vec::new(),
+            },
         };
         let field_metadata = CustomFieldMetadata::empty();
         let field_filter = FieldFilter::default();
@@ -695,5 +725,97 @@ mod tests {
         let expected =
             "## Comments\n\n**Alice** - _2024-01-15 10:30 AM_\n\nhello world\n";
         assert_eq!(rendered, expected);
+    }
+
+    /// AC#5: the frontmatter section, built from a *literal* `Issue` (no
+    /// `json!()` fixture, `raw: Value::Null`), renders every newly-typed
+    /// display field. Asserting `contains` on each key/value pair guards the
+    /// `Issue::field`/`raw` removal: if any standard field were still being
+    /// fetched off `raw`, this test would fail because `raw` is `Null`.
+    #[test]
+    fn frontmatter_section_renders_typed_display_fields() {
+        let issue = Issue {
+            raw: serde_json::Value::Null,
+            key: "PROJ-1".into(),
+            summary: "Typed frontmatter".into(),
+            created: "2026-05-01T08:00:00.000+0000".into(),
+            updated: "2026-05-22T10:00:00.000+0000".into(),
+            duedate: Some("2026-06-30".into()),
+            resolutiondate: None,
+            issuetype: IssueType {
+                name: "Bug".into(),
+            },
+            status: Status {
+                name: "Open".into(),
+                category: Some("To Do".into()),
+            },
+            priority: Some(Priority {
+                name: "High".into(),
+            }),
+            resolution: None::<Resolution>,
+            project: Project {
+                name: "Project X".into(),
+                key: "PROJ".into(),
+            },
+            assignee: Some(User {
+                display_name: "Jane".into(),
+            }),
+            reporter: Some(User {
+                display_name: "Bob".into(),
+            }),
+            creator: Some(User {
+                display_name: "Bot".into(),
+            }),
+            labels: vec!["a".into(), "b".into()],
+            components: vec![NamedRef { name: "UI".into() }],
+            versions: Vec::new(),
+            fix_versions: vec![NamedRef {
+                name: "v1.0".into(),
+            }],
+            timetracking: TimeTracking {
+                original_estimate: None,
+                remaining_estimate: None,
+                time_spent: None,
+            },
+            progress: Progress { percent: 0 },
+            aggregateprogress: Progress { percent: 0 },
+            votes: Votes { votes: 3 },
+            watches: Watches { watch_count: 8 },
+            environment: RichText::Empty,
+            description: RichText::Empty,
+            comments: Vec::new(),
+            attachments: Vec::new(),
+            issuelinks: Vec::new(),
+            parent: None,
+            subtasks: Vec::new(),
+            worklog: WorklogPage {
+                total: 0,
+                entries: Vec::new(),
+            },
+        };
+        let field_metadata = CustomFieldMetadata::empty();
+        let field_filter = FieldFilter::default();
+        let ctx = RenderContext {
+            issue: &issue,
+            downloaded: &[],
+            skipped_attachments: &[],
+            attachments: AttachmentIndex::empty(),
+            field_metadata: &field_metadata,
+            field_filter: &field_filter,
+            child_issues: &[],
+            changelog_summary: None,
+            base_url: "https://example.atlassian.net",
+            domain: "example.atlassian.net",
+        };
+        let rendered = frontmatter(&ctx).join("\n");
+        assert!(rendered.contains("priority: High"));
+        assert!(rendered.contains("project: Project X"));
+        assert!(rendered.contains("project_key: PROJ"));
+        assert!(rendered.contains("reporter: Bob"));
+        assert!(rendered.contains("creator: Bot"));
+        assert!(rendered.contains("votes: 3"));
+        assert!(rendered.contains("watches: 8"));
+        assert!(rendered.contains("- a")); // labels
+        assert!(rendered.contains("- UI")); // components
     }
 }

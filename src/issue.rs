@@ -6,8 +6,8 @@
 //!
 //! See ADR-0002 for why [`Issue`] retains its raw payload (`raw`) alongside the
 //! typed "spine" fields: `--include-json` serializes `raw` byte-for-byte, and
-//! `raw` is the access path for the ~19 display-only standard fields and all
-//! custom fields, reached via [`Issue::field`].
+//! `raw` is the access path for `customfield_*` values, reached via
+//! [`Issue::field`].
 //!
 //! Parsing is strict about *shape*: a field present with an unexpected JSON
 //! type is a hard [`JarkdownError::MalformedPayload`]. An absent or `null`
@@ -73,6 +73,83 @@ pub struct User {
     pub display_name: String,
 }
 
+/// `fields.priority` — only the display name is consumed by the renderer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Priority {
+    pub name: String,
+}
+
+/// `fields.resolution` — only the display name is consumed by the renderer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Resolution {
+    pub name: String,
+}
+
+/// `fields.project` — present unconditionally; absent/null degrades to empty
+/// strings (renderer prints `null` in YAML when either is empty).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Project {
+    pub name: String,
+    pub key: String,
+}
+
+/// A named reference (`fields.components[]`, `fields.versions[]`,
+/// `fields.fixVersions[]`) — only `name` is consumed by the renderer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamedRef {
+    pub name: String,
+}
+
+/// `fields.timetracking` — present unconditionally; each estimate is
+/// optional. The renderer prints `null` for absent estimates.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimeTracking {
+    pub original_estimate: Option<String>,
+    pub remaining_estimate: Option<String>,
+    pub time_spent: Option<String>,
+}
+
+/// `fields.progress` / `fields.aggregateprogress` — present unconditionally.
+/// `percent` defaults to `0` when absent (load-bearing: the PSOP-5624
+/// baseline payload omits `percent`, and the renderer prints `0`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Progress {
+    pub percent: u64,
+}
+
+/// `fields.votes` — present unconditionally; only `votes` is consumed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Votes {
+    pub votes: u64,
+}
+
+/// `fields.watches` — present unconditionally; only `watchCount` is consumed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Watches {
+    pub watch_count: u64,
+}
+
+/// `fields.worklog` — paginated worklog summary. `total` is the server-side
+/// count (may exceed `entries.len()`); the renderer warns when truncation
+/// has occurred.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorklogPage {
+    pub total: u64,
+    pub entries: Vec<WorklogEntry>,
+}
+
+/// One worklog entry. `comment` deliberately STAYS `Value` — the renderer
+/// passes it straight to `adf_to_plain_text`, and typing it as `RichText`
+/// would force an unnecessary HTML/ADF branch here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorklogEntry {
+    pub author: String,
+    pub time_spent: String,
+    pub started: String,
+    pub time_spent_seconds: u64,
+    pub comment: Value,
+}
+
 /// A free-text comment posted on an issue.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Comment {
@@ -113,22 +190,47 @@ pub struct ChangelogItem {
 
 /// A fully-fetched Jira issue: the untouched payload (`raw`) plus the typed
 /// "spine" fields the rest of the codebase relies on.
+///
+/// After issue #13, the ~19 display-only standard fields are also typed; the
+/// renderer reaches the raw payload only for `customfield_*` and for
+/// per-entry walks of `issuelinks`, `subtasks`, and `attachment`. `raw` and
+/// [`Issue::field`] remain (ADR-0002) because `--include-json` re-serializes
+/// `raw` byte-for-byte and `field()` is the access path for `customfield_*`.
 #[derive(Debug, Clone)]
 pub struct Issue {
     /// The untouched payload from `fetch_issue`. See ADR-0002 — do not remove.
     pub raw: Value,
     pub key: String,
     pub summary: String,
+    pub created: String,
     pub updated: String,
+    pub duedate: Option<String>,
+    pub resolutiondate: Option<String>,
     pub issuetype: IssueType,
     pub status: Status,
+    pub priority: Option<Priority>,
+    pub resolution: Option<Resolution>,
+    pub project: Project,
     pub assignee: Option<User>,
+    pub reporter: Option<User>,
+    pub creator: Option<User>,
+    pub labels: Vec<String>,
+    pub components: Vec<NamedRef>,
+    pub versions: Vec<NamedRef>,
+    pub fix_versions: Vec<NamedRef>,
+    pub timetracking: TimeTracking,
+    pub progress: Progress,
+    pub aggregateprogress: Progress,
+    pub votes: Votes,
+    pub watches: Watches,
+    pub environment: RichText,
     pub description: RichText,
     pub comments: Vec<Comment>,
     pub attachments: Vec<Value>,
     pub issuelinks: Vec<Value>,
     pub parent: Option<Value>,
     pub subtasks: Vec<Value>,
+    pub worklog: WorklogPage,
 }
 
 /// The lightweight projection returned by `search_jql` (`key`, `summary`,
@@ -224,6 +326,187 @@ fn parse_parent(v: &Value) -> Result<Option<Value>> {
     }
 }
 
+fn parse_priority(v: &Value) -> Result<Option<Priority>> {
+    match v {
+        Value::Null => Ok(None),
+        Value::Object(_) => Ok(Some(Priority {
+            name: parse_string(&v["name"], "priority.name")?,
+        })),
+        _ => Err(malformed("priority")),
+    }
+}
+
+fn parse_resolution(v: &Value) -> Result<Option<Resolution>> {
+    match v {
+        Value::Null => Ok(None),
+        Value::Object(_) => Ok(Some(Resolution {
+            name: parse_string(&v["name"], "resolution.name")?,
+        })),
+        _ => Err(malformed("resolution")),
+    }
+}
+
+fn parse_project(v: &Value) -> Result<Project> {
+    match v {
+        Value::Null => Ok(Project {
+            name: String::new(),
+            key: String::new(),
+        }),
+        Value::Object(_) => Ok(Project {
+            name: parse_string(&v["name"], "project.name")?,
+            key: parse_string(&v["key"], "project.key")?,
+        }),
+        _ => Err(malformed("project")),
+    }
+}
+
+/// An array-of-strings field (e.g. `fields.labels`). Absent/null → empty;
+/// any non-string element is hard schema drift.
+fn parse_string_array(v: &Value, field: &str) -> Result<Vec<String>> {
+    match v {
+        Value::Null => Ok(Vec::new()),
+        Value::Array(a) => {
+            let mut out = Vec::with_capacity(a.len());
+            for item in a {
+                match item {
+                    Value::String(s) => out.push(s.clone()),
+                    _ => return Err(malformed(field)),
+                }
+            }
+            Ok(out)
+        }
+        _ => Err(malformed(field)),
+    }
+}
+
+/// An array of name-only references (`fields.components`, `fields.versions`,
+/// `fields.fixVersions`). Each element must be an object; only `name` is
+/// consumed.
+fn parse_named_ref_array(v: &Value, field: &str) -> Result<Vec<NamedRef>> {
+    match v {
+        Value::Null => Ok(Vec::new()),
+        Value::Array(a) => {
+            let mut out = Vec::with_capacity(a.len());
+            for item in a {
+                match item {
+                    Value::Object(_) => out.push(NamedRef {
+                        name: parse_string(&item["name"], "namedRef.name")?,
+                    }),
+                    _ => return Err(malformed(field)),
+                }
+            }
+            Ok(out)
+        }
+        _ => Err(malformed(field)),
+    }
+}
+
+fn parse_timetracking(v: &Value) -> Result<TimeTracking> {
+    match v {
+        Value::Null => Ok(TimeTracking {
+            original_estimate: None,
+            remaining_estimate: None,
+            time_spent: None,
+        }),
+        Value::Object(_) => Ok(TimeTracking {
+            original_estimate: parse_opt_string(
+                &v["originalEstimate"],
+                "timetracking.originalEstimate",
+            )?,
+            remaining_estimate: parse_opt_string(
+                &v["remainingEstimate"],
+                "timetracking.remainingEstimate",
+            )?,
+            time_spent: parse_opt_string(&v["timeSpent"], "timetracking.timeSpent")?,
+        }),
+        _ => Err(malformed("timetracking")),
+    }
+}
+
+/// A `u64` field that absent/null → 0; a present non-integer is hard schema
+/// drift. The default `0` is load-bearing for `progress.percent`,
+/// `votes.votes`, and `watches.watchCount`: the PSOP-5624 baseline omits
+/// `percent` and the renderer still prints `0`.
+fn parse_u64(v: &Value, field: &str) -> Result<u64> {
+    match v {
+        Value::Null => Ok(0),
+        Value::Number(n) => n.as_u64().ok_or_else(|| malformed(field)),
+        _ => Err(malformed(field)),
+    }
+}
+
+fn parse_progress(v: &Value, field: &str) -> Result<Progress> {
+    match v {
+        Value::Null => Ok(Progress { percent: 0 }),
+        Value::Object(_) => Ok(Progress {
+            percent: parse_u64(&v["percent"], "progress.percent")?,
+        }),
+        _ => Err(malformed(field)),
+    }
+}
+
+fn parse_votes(v: &Value) -> Result<Votes> {
+    match v {
+        Value::Null => Ok(Votes { votes: 0 }),
+        Value::Object(_) => Ok(Votes {
+            votes: parse_u64(&v["votes"], "votes.votes")?,
+        }),
+        _ => Err(malformed("votes")),
+    }
+}
+
+fn parse_watches(v: &Value) -> Result<Watches> {
+    match v {
+        Value::Null => Ok(Watches { watch_count: 0 }),
+        Value::Object(_) => Ok(Watches {
+            watch_count: parse_u64(&v["watchCount"], "watches.watchCount")?,
+        }),
+        _ => Err(malformed("watches")),
+    }
+}
+
+fn parse_worklog_page(v: &Value) -> Result<WorklogPage> {
+    match v {
+        Value::Null => Ok(WorklogPage {
+            total: 0,
+            entries: Vec::new(),
+        }),
+        Value::Object(_) => {
+            let total = parse_u64(&v["total"], "worklog.total")?;
+            let raw_entries = parse_array(&v["worklogs"], "worklog.worklogs")?;
+            let mut entries = Vec::with_capacity(raw_entries.len());
+            for e in &raw_entries {
+                if !e.is_object() {
+                    return Err(malformed("worklog.worklogs[]"));
+                }
+                entries.push(WorklogEntry {
+                    author: parse_string(
+                        &e["author"]["displayName"],
+                        "worklog.worklogs[].author.displayName",
+                    )?,
+                    time_spent: parse_string(
+                        &e["timeSpent"],
+                        "worklog.worklogs[].timeSpent",
+                    )?,
+                    started: parse_string(
+                        &e["started"],
+                        "worklog.worklogs[].started",
+                    )?,
+                    time_spent_seconds: parse_u64(
+                        &e["timeSpentSeconds"],
+                        "worklog.worklogs[].timeSpentSeconds",
+                    )?,
+                    // `comment` stays Value — the renderer hands it straight
+                    // to `adf_to_plain_text`.
+                    comment: e["comment"].clone(),
+                });
+            }
+            Ok(WorklogPage { total, entries })
+        }
+        _ => Err(malformed("worklog")),
+    }
+}
+
 fn parse_comments(fields: &Value, rendered_fields: &Value) -> Result<Vec<Comment>> {
     let raw_comments = match &fields["comment"]["comments"] {
         Value::Null => return Ok(Vec::new()),
@@ -264,52 +547,111 @@ impl Issue {
     pub fn from_value(raw: Value) -> Result<Issue> {
         let key;
         let summary;
+        let created;
         let updated;
+        let duedate;
+        let resolutiondate;
         let issuetype;
         let status;
+        let priority;
+        let resolution;
+        let project;
         let assignee;
+        let reporter;
+        let creator;
+        let labels;
+        let components;
+        let versions;
+        let fix_versions;
+        let timetracking;
+        let progress;
+        let aggregateprogress;
+        let votes;
+        let watches;
+        let environment;
         let description;
         let comments;
         let attachments;
         let issuelinks;
         let parent;
         let subtasks;
+        let worklog;
         {
             let fields = &raw["fields"];
             let rendered = &raw["renderedFields"];
             key = parse_string(&raw["key"], "key")?;
             summary = parse_string(&fields["summary"], "summary")?;
+            created = parse_string(&fields["created"], "created")?;
             updated = parse_string(&fields["updated"], "updated")?;
+            duedate = parse_opt_string(&fields["duedate"], "duedate")?;
+            resolutiondate = parse_opt_string(&fields["resolutiondate"], "resolutiondate")?;
             issuetype = parse_issuetype(&fields["issuetype"], "issuetype")?;
             status = parse_status(&fields["status"], "status")?;
+            priority = parse_priority(&fields["priority"])?;
+            resolution = parse_resolution(&fields["resolution"])?;
+            project = parse_project(&fields["project"])?;
             assignee = parse_user(&fields["assignee"], "assignee")?;
+            reporter = parse_user(&fields["reporter"], "reporter")?;
+            creator = parse_user(&fields["creator"], "creator")?;
+            labels = parse_string_array(&fields["labels"], "labels")?;
+            components = parse_named_ref_array(&fields["components"], "components")?;
+            versions = parse_named_ref_array(&fields["versions"], "versions")?;
+            fix_versions = parse_named_ref_array(&fields["fixVersions"], "fixVersions")?;
+            timetracking = parse_timetracking(&fields["timetracking"])?;
+            progress = parse_progress(&fields["progress"], "progress")?;
+            aggregateprogress = parse_progress(&fields["aggregateprogress"], "aggregateprogress")?;
+            votes = parse_votes(&fields["votes"])?;
+            watches = parse_watches(&fields["watches"])?;
+            environment = RichText::resolve(&fields["environment"], &rendered["environment"]);
             description = RichText::resolve(&fields["description"], &rendered["description"]);
             comments = parse_comments(fields, rendered)?;
             attachments = parse_array(&fields["attachment"], "attachment")?;
             issuelinks = parse_array(&fields["issuelinks"], "issuelinks")?;
             parent = parse_parent(&fields["parent"])?;
             subtasks = parse_array(&fields["subtasks"], "subtasks")?;
+            worklog = parse_worklog_page(&fields["worklog"])?;
         }
         Ok(Issue {
             raw,
             key,
             summary,
+            created,
             updated,
+            duedate,
+            resolutiondate,
             issuetype,
             status,
+            priority,
+            resolution,
+            project,
             assignee,
+            reporter,
+            creator,
+            labels,
+            components,
+            versions,
+            fix_versions,
+            timetracking,
+            progress,
+            aggregateprogress,
+            votes,
+            watches,
+            environment,
             description,
             comments,
             attachments,
             issuelinks,
             parent,
             subtasks,
+            worklog,
         })
     }
 
-    /// Access an unmodeled standard or custom field by name off `raw["fields"]`.
-    /// This is the escape hatch for the ~19 display-only standard fields and
-    /// all `customfield_*` values that are deliberately not typed.
+    /// Access an unmodeled field by name off `raw["fields"]`.
+    ///
+    /// After issue #13, every previously-display-only standard field has a
+    /// typed home on [`Issue`]; this method is the escape hatch only for
+    /// `customfield_*` values, which are deliberately not modeled.
     pub fn field(&self, name: &str) -> Option<&Value> {
         self.raw
             .get("fields")
@@ -567,6 +909,115 @@ mod tests {
             bad_items,
             Err(JarkdownError::MalformedPayload(_))
         ));
+    }
+
+    #[test]
+    fn from_value_types_display_only_fields() {
+        // AC#1: the ~19 display-only standard fields now have typed parsers.
+        let raw = json!({
+            "key": "K1",
+            "fields": {
+                "summary": "S",
+                "created": "2026-05-01T00:00:00.000+0000",
+                "updated": "2026-05-22T10:00:00.000+0000",
+                "duedate": "2026-06-30",
+                "resolutiondate": null,
+                "issuetype": { "name": "Bug" },
+                "status": { "name": "Open" },
+                "priority": { "name": "High" },
+                "resolution": null,
+                "project": { "name": "Proj X", "key": "PX" },
+                "assignee": null,
+                "reporter": { "displayName": "Bob" },
+                "creator": { "displayName": "Bot" },
+                "labels": ["a", "b"],
+                "components": [{ "name": "UI" }],
+                "versions": [],
+                "fixVersions": [{ "name": "v1.0" }],
+                "timetracking": { "originalEstimate": "1d", "remainingEstimate": null, "timeSpent": "2h" },
+                // `progress` deliberately omits `percent` to match the baseline
+                // payload — typed default `0` is load-bearing.
+                "progress": {},
+                "aggregateprogress": { "percent": 50 },
+                "votes": { "votes": 3 },
+                "watches": { "watchCount": 8 },
+                "environment": null,
+                "worklog": {
+                    "total": 1,
+                    "worklogs": [
+                        {
+                            "author": { "displayName": "Alice" },
+                            "timeSpent": "30m",
+                            "started": "2026-05-10T12:00:00.000+0000",
+                            "timeSpentSeconds": 1800,
+                            "comment": { "type": "doc", "content": [] }
+                        }
+                    ]
+                }
+            }
+        });
+        let issue = Issue::from_value(raw).expect("parse");
+        assert_eq!(issue.created, "2026-05-01T00:00:00.000+0000");
+        assert_eq!(issue.duedate.as_deref(), Some("2026-06-30"));
+        assert_eq!(issue.resolutiondate, None);
+        assert_eq!(issue.priority.as_ref().map(|p| p.name.as_str()), Some("High"));
+        assert!(issue.resolution.is_none());
+        assert_eq!(issue.project.name, "Proj X");
+        assert_eq!(issue.project.key, "PX");
+        assert_eq!(
+            issue.reporter.as_ref().map(|u| u.display_name.as_str()),
+            Some("Bob")
+        );
+        assert_eq!(
+            issue.creator.as_ref().map(|u| u.display_name.as_str()),
+            Some("Bot")
+        );
+        assert_eq!(issue.labels, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(issue.components.len(), 1);
+        assert_eq!(issue.components[0].name, "UI");
+        assert!(issue.versions.is_empty());
+        assert_eq!(issue.fix_versions.len(), 1);
+        assert_eq!(issue.fix_versions[0].name, "v1.0");
+        assert_eq!(issue.timetracking.original_estimate.as_deref(), Some("1d"));
+        assert_eq!(issue.timetracking.remaining_estimate, None);
+        assert_eq!(issue.timetracking.time_spent.as_deref(), Some("2h"));
+        assert_eq!(issue.progress.percent, 0);
+        assert_eq!(issue.aggregateprogress.percent, 50);
+        assert_eq!(issue.votes.votes, 3);
+        assert_eq!(issue.watches.watch_count, 8);
+        assert_eq!(issue.environment, RichText::Empty);
+        assert_eq!(issue.worklog.total, 1);
+        assert_eq!(issue.worklog.entries.len(), 1);
+        assert_eq!(issue.worklog.entries[0].author, "Alice");
+        assert_eq!(issue.worklog.entries[0].time_spent, "30m");
+        assert_eq!(issue.worklog.entries[0].started, "2026-05-10T12:00:00.000+0000");
+        assert_eq!(issue.worklog.entries[0].time_spent_seconds, 1800);
+        // `comment` STAYS Value — the renderer hands it to `adf_to_plain_text`.
+        assert!(issue.worklog.entries[0].comment.is_object());
+    }
+
+    #[test]
+    fn from_value_rejects_wrong_typed_display_fields() {
+        // labels-as-object is hard schema drift.
+        let err = Issue::from_value(json!({
+            "key": "K1",
+            "fields": { "summary": "S", "labels": { "not": "an array" } }
+        }));
+        assert!(matches!(err, Err(JarkdownError::MalformedPayload(_))));
+
+        // priority-as-string is hard schema drift.
+        let err = Issue::from_value(json!({
+            "key": "K1",
+            "fields": { "summary": "S", "priority": "High" }
+        }));
+        assert!(matches!(err, Err(JarkdownError::MalformedPayload(_))));
+
+        // votes.votes-as-string is hard schema drift.
+        let err = Issue::from_value(json!({
+            "key": "K1",
+            "fields": { "summary": "S", "votes": { "votes": "many" } }
+        }));
+        assert!(matches!(err, Err(JarkdownError::MalformedPayload(_))));
     }
 
     #[test]
