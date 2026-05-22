@@ -12,7 +12,7 @@ use std::pin::Pin;
 use log::{info, warn};
 
 use crate::error::Result;
-use crate::export::{perform_export_with_options, ExportWorkflowOptions};
+use crate::exporter::IssueExporter;
 use crate::field_cache::FieldMetadataCache;
 use crate::jira_client::JiraApiClient;
 
@@ -42,15 +42,21 @@ pub struct HierarchyOptions {
 /// Orchestrates discovery and export of an issue hierarchy.
 pub struct HierarchyExporter<'a> {
     api_client: &'a JiraApiClient,
+    exporter: &'a dyn IssueExporter,
     options: HierarchyOptions,
     visited: HashSet<String>,
     issue_count: u32,
 }
 
 impl<'a> HierarchyExporter<'a> {
-    pub fn new(api_client: &'a JiraApiClient, options: HierarchyOptions) -> Self {
+    pub fn new(
+        api_client: &'a JiraApiClient,
+        exporter: &'a dyn IssueExporter,
+        options: HierarchyOptions,
+    ) -> Self {
         Self {
             api_client,
+            exporter,
             options,
             visited: HashSet::new(),
             issue_count: 0,
@@ -113,21 +119,7 @@ impl<'a> HierarchyExporter<'a> {
 
         // Export this issue
         let issue_dir = output_dir.join(issue_key);
-        perform_export_with_options(
-            self.api_client,
-            issue_key,
-            &issue_dir,
-            ExportWorkflowOptions {
-                refresh_fields: self.options.refresh_fields,
-                include_fields: self.options.include_fields.as_deref(),
-                exclude_fields: self.options.exclude_fields.as_deref(),
-                include_json: self.options.include_json,
-                attachment_concurrency: self.options.attachment_concurrency,
-                no_attachments: self.options.no_attachments,
-                include_changelog: self.options.include_changelog,
-            },
-        )
-        .await?;
+        self.exporter.export(issue_key, &issue_dir).await?;
 
         // Fetch the issue for metadata + child discovery
         let issue = self.api_client.fetch_issue(issue_key).await?;
@@ -336,7 +328,10 @@ fn is_parent_link_type(link_type: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::export::ExportWorkflowOptions;
+    use crate::exporter::WorkflowIssueExporter;
     use crate::jira_client::JiraApiClient;
+    use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
@@ -361,7 +356,20 @@ mod tests {
             include_changelog: false,
         };
 
-        let mut exporter = HierarchyExporter::new(&client, options);
+        let workflow_options = ExportWorkflowOptions {
+            refresh_fields: options.refresh_fields,
+            include_fields: options.include_fields.as_deref(),
+            exclude_fields: options.exclude_fields.as_deref(),
+            include_json: options.include_json,
+            attachment_concurrency: options.attachment_concurrency,
+            no_attachments: options.no_attachments,
+            include_changelog: options.include_changelog,
+        };
+        let workflow_exporter = WorkflowIssueExporter {
+            api_client: &client,
+            options: workflow_options,
+        };
+        let mut exporter = HierarchyExporter::new(&client, &workflow_exporter, options.clone());
         let tree = exporter
             .export_hierarchy("K1", &output_dir)
             .await
@@ -525,5 +533,286 @@ mod tests {
         }}"#,
             base_url
         )
+    }
+
+    // ---------------------------------------------------------------------
+    // Fake IssueExporter + scriptable Jira server for hierarchy seam tests.
+    // ---------------------------------------------------------------------
+
+    /// Records each issue key the hierarchy traverses, without touching disk
+    /// or network for the export step itself.
+    #[derive(Default)]
+    struct RecordingExporter {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl IssueExporter for RecordingExporter {
+        fn export<'a>(
+            &'a self,
+            issue_key: &'a str,
+            _output_dir: &'a std::path::Path,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<()>> + 'a>>
+        {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(issue_key.to_string());
+                Ok(())
+            })
+        }
+    }
+
+    impl RecordingExporter {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    /// Scriptable test server: maps issue keys to a list of "issue link
+    /// outward" child keys, served via the minimal Jira issue shape that
+    /// `Issue::from_value` accepts. JQL search always returns no children.
+    struct ScriptedJiraServer {
+        base_url: String,
+    }
+
+    impl ScriptedJiraServer {
+        fn start(graph: HashMap<String, Vec<String>>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("test server bind");
+            let addr = listener.local_addr().expect("test server addr");
+            let base_url = format!("http://{}", addr);
+            let graph = Arc::new(graph);
+
+            thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let g = graph.clone();
+                    handle_scripted_request(stream, g);
+                }
+            });
+
+            Self { base_url }
+        }
+    }
+
+    fn handle_scripted_request(mut stream: TcpStream, graph: Arc<HashMap<String, Vec<String>>>) {
+        let mut buffer = [0; 8192];
+        let bytes_read = stream.read(&mut buffer).expect("read request");
+        let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+        let path = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_string();
+
+        let body = if let Some(key) = parse_issue_key(&path) {
+            let children = graph.get(&key).cloned().unwrap_or_default();
+            scripted_issue_response(&key, &children)
+        } else if path.starts_with("/rest/api/3/field") {
+            "[]".to_string()
+        } else if path.starts_with("/rest/api/3/search/jql") {
+            r#"{"issues":[]}"#.to_string()
+        } else {
+            "{}".to_string()
+        };
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write response");
+    }
+
+    /// Extract the issue key from `/rest/api/3/issue/{KEY}?...`. Returns
+    /// None for non-issue endpoints (or the changelog sub-resource, which
+    /// these tests don't exercise).
+    fn parse_issue_key(path: &str) -> Option<String> {
+        let rest = path.strip_prefix("/rest/api/3/issue/")?;
+        // Trim query string
+        let without_query = rest.split('?').next().unwrap_or("");
+        // Reject sub-paths like "K1/changelog"
+        if without_query.contains('/') {
+            return None;
+        }
+        if without_query.is_empty() {
+            return None;
+        }
+        Some(without_query.to_string())
+    }
+
+    /// Minimal issue JSON: the given key plus outward links to each child key
+    /// using the JPD "is implemented by" relationship, which
+    /// `is_parent_link_type` recognizes as a parent-child edge.
+    fn scripted_issue_response(key: &str, children: &[String]) -> String {
+        let links: Vec<String> = children
+            .iter()
+            .map(|child| {
+                format!(
+                    r#"{{
+                    "type": {{ "outward": "is implemented by", "inward": "implements" }},
+                    "outwardIssue": {{ "key": "{}" }}
+                }}"#,
+                    child
+                )
+            })
+            .collect();
+        let links_json = links.join(",");
+
+        format!(
+            r#"{{
+            "key": "{}",
+            "renderedFields": {{}},
+            "fields": {{
+                "summary": "Issue {}",
+                "issuetype": {{ "name": "Task" }},
+                "status": {{ "name": "Open", "statusCategory": {{ "name": "To Do" }} }},
+                "priority": {{ "name": "Medium" }},
+                "resolution": null,
+                "project": {{ "name": "Project", "key": "PROJ" }},
+                "assignee": null,
+                "reporter": null,
+                "creator": null,
+                "labels": [],
+                "components": [],
+                "parent": null,
+                "subtasks": [],
+                "issuelinks": [{}],
+                "worklog": {{ "worklogs": [] }},
+                "comment": {{ "comments": [] }},
+                "attachment": []
+            }}
+        }}"#,
+            key, key, links_json
+        )
+    }
+
+    fn default_hierarchy_options(max_depth: u32, max_issues: u32) -> HierarchyOptions {
+        HierarchyOptions {
+            max_depth,
+            max_issues,
+            refresh_fields: false,
+            include_fields: None,
+            exclude_fields: None,
+            include_json: false,
+            attachment_concurrency: 1,
+            no_attachments: true,
+            include_changelog: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn hierarchy_skips_already_visited_issue_via_fake_exporter() {
+        // A -> B and B -> A; the cycle should be detected on the second visit.
+        let mut graph = HashMap::new();
+        graph.insert("A".to_string(), vec!["B".to_string()]);
+        graph.insert("B".to_string(), vec!["A".to_string()]);
+
+        let server = ScriptedJiraServer::start(graph);
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let output_dir = unique_temp_dir("jarkdown-cycle");
+        let options = default_hierarchy_options(5, 10);
+        let fake = RecordingExporter::default();
+
+        let mut exporter = HierarchyExporter::new(&client, &fake, options);
+        let tree = exporter
+            .export_hierarchy("A", &output_dir)
+            .await
+            .expect("hierarchy export");
+
+        // Each unique key is exported exactly once.
+        let mut calls = fake.calls();
+        calls.sort();
+        assert_eq!(calls, vec!["A".to_string(), "B".to_string()]);
+
+        // Root is A with B as a child; B's child A is the "already visited"
+        // sentinel node.
+        assert_eq!(tree.key, "A");
+        assert_eq!(tree.children.len(), 1);
+        let b = &tree.children[0];
+        assert_eq!(b.key, "B");
+        assert_eq!(b.children.len(), 1);
+        let cycle_back = &b.children[0];
+        assert_eq!(cycle_back.key, "A");
+        assert_eq!(cycle_back.summary, "(already visited)");
+        assert_eq!(cycle_back.issue_type, "");
+
+        std::fs::remove_dir_all(output_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn hierarchy_respects_max_depth_cap_via_fake_exporter() {
+        // Chain A -> B -> C -> D with max_depth = 2. The exporter is called
+        // for A (depth 0), B (depth 1), and C (depth 2); D is not exported
+        // because traversal stops once depth >= max_depth.
+        let mut graph = HashMap::new();
+        graph.insert("A".to_string(), vec!["B".to_string()]);
+        graph.insert("B".to_string(), vec!["C".to_string()]);
+        graph.insert("C".to_string(), vec!["D".to_string()]);
+        graph.insert("D".to_string(), vec![]);
+
+        let server = ScriptedJiraServer::start(graph);
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let output_dir = unique_temp_dir("jarkdown-maxdepth");
+        let options = default_hierarchy_options(2, 100);
+        let fake = RecordingExporter::default();
+
+        let mut exporter = HierarchyExporter::new(&client, &fake, options);
+        let _tree = exporter
+            .export_hierarchy("A", &output_dir)
+            .await
+            .expect("hierarchy export");
+
+        assert_eq!(
+            fake.calls(),
+            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            "D must not be exported once max_depth is reached"
+        );
+
+        std::fs::remove_dir_all(output_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn hierarchy_respects_max_issues_cap_via_fake_exporter() {
+        // A fans out to B, C, D, E. With max_issues = 3 only A and the first
+        // two siblings (B, C) should be exported; the "Reached max issue
+        // limit" guard at line 190 short-circuits the remaining iterations.
+        let mut graph = HashMap::new();
+        graph.insert(
+            "A".to_string(),
+            vec![
+                "B".to_string(),
+                "C".to_string(),
+                "D".to_string(),
+                "E".to_string(),
+            ],
+        );
+        graph.insert("B".to_string(), vec![]);
+        graph.insert("C".to_string(), vec![]);
+        graph.insert("D".to_string(), vec![]);
+        graph.insert("E".to_string(), vec![]);
+
+        let server = ScriptedJiraServer::start(graph);
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let output_dir = unique_temp_dir("jarkdown-maxissues");
+        let options = default_hierarchy_options(5, 3);
+        let fake = RecordingExporter::default();
+
+        let mut exporter = HierarchyExporter::new(&client, &fake, options);
+        let _tree = exporter
+            .export_hierarchy("A", &output_dir)
+            .await
+            .expect("hierarchy export");
+
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 3, "exporter should run exactly max_issues times");
+        assert_eq!(calls[0], "A");
+        // Children are appended in discovery order; the first two siblings win.
+        let exported_children: std::collections::HashSet<_> = calls[1..].iter().cloned().collect();
+        assert!(exported_children.contains("B"));
+        assert!(exported_children.contains("C"));
+        assert!(!exported_children.contains("D"));
+        assert!(!exported_children.contains("E"));
+
+        std::fs::remove_dir_all(output_dir).ok();
     }
 }

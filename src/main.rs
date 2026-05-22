@@ -519,7 +519,20 @@ async fn run_hierarchy_export(
         include_changelog: shared.include_changelog,
     };
 
-    let mut exporter = HierarchyExporter::new(client, options);
+    let workflow_options = ExportWorkflowOptions {
+        refresh_fields: options.refresh_fields,
+        include_fields: options.include_fields.as_deref(),
+        exclude_fields: options.exclude_fields.as_deref(),
+        include_json: options.include_json,
+        attachment_concurrency: options.attachment_concurrency,
+        no_attachments: options.no_attachments,
+        include_changelog: options.include_changelog,
+    };
+    let workflow_exporter = jarkdown::exporter::WorkflowIssueExporter {
+        api_client: client,
+        options: workflow_options,
+    };
+    let mut exporter = HierarchyExporter::new(client, &workflow_exporter, options.clone());
     let export = exporter.export_hierarchy(issue_key, output_dir);
     match time::timeout(Duration::from_secs(shared.issue_timeout_seconds), export).await {
         Err(_) => {
