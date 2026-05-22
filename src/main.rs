@@ -12,6 +12,7 @@ use tokio::time;
 use jarkdown::bulk::BulkExporter;
 use jarkdown::cli::{self, Cli, Command};
 use jarkdown::export::{perform_export_with_options, ExportWorkflowOptions};
+use jarkdown::freshness::{self, ExportPlan};
 use jarkdown::hierarchy::{HierarchyExporter, HierarchyOptions};
 use jarkdown::issue::IssueSearchResult;
 use jarkdown::jira_client::JiraApiClient;
@@ -237,9 +238,42 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
         let parent_dir = output_path.parent().unwrap_or(std::path::Path::new("."));
         let manifest = Manifest::load(parent_dir);
         if let Ok(issue) = client.fetch_issue(&args.issue_key).await {
-            if !manifest.is_stale(&args.issue_key, &issue.updated) {
-                info!("Skipping {} (unchanged since last export)", args.issue_key);
-                return;
+            match freshness::plan(
+                &issue,
+                &manifest,
+                args.shared.include_changelog,
+                &output_path,
+            ) {
+                ExportPlan::Skip => {
+                    info!("Skipping {} (unchanged since last export)", args.issue_key);
+                    return;
+                }
+                ExportPlan::BackfillChangelogOnly => {
+                    info!(
+                        "Backfilling changelog for {} (issue unchanged)",
+                        args.issue_key
+                    );
+                    match client.fetch_changelog(&args.issue_key).await {
+                        Ok(entries) => {
+                            if let Err(e) = jarkdown::changelog::write_artifacts(
+                                &args.issue_key,
+                                &issue.summary,
+                                &entries,
+                                &output_path,
+                                args.shared.include_json,
+                            )
+                            .await
+                            {
+                                eprintln!("Warning: changelog backfill failed: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: changelog backfill fetch failed: {}", e)
+                        }
+                    }
+                    return;
+                }
+                ExportPlan::Full => {}
             }
         }
     }

@@ -16,6 +16,7 @@ use log::info;
 
 use crate::error::Result;
 use crate::export::{perform_export_with_options, ExportWorkflowOptions};
+use crate::freshness::{self, ExportPlan};
 use crate::issue::Issue;
 use crate::jira_client::JiraApiClient;
 use crate::manifest::Manifest;
@@ -148,32 +149,27 @@ impl BulkExporter {
                         if let Some(ref m) = manifest_ref {
                             if !force {
                                 if let Ok(issue) = client.fetch_issue(&key).await {
-                                    if !m.is_stale(&key, &issue.updated) {
-                                        let path = output_dir.join(&key);
-                                        // Backfill: if changelog opt-in is on but the file
-                                        // is missing (e.g. user just enabled the flag),
-                                        // fetch and write the changelog without re-fetching
-                                        // or rewriting the main issue payload.
-                                        let changelog_path = path
-                                            .join(format!("{}.changelog.md", key));
-                                        if include_changelog && !changelog_path.exists() {
-                                            backfill_changelog(
-                                                &client,
-                                                &key,
-                                                &path,
-                                                &issue,
-                                                json,
-                                            )
-                                            .await;
-                                        } else {
+                                    let path = output_dir.join(&key);
+                                    let unchanged = ExportResult {
+                                        issue_key: key.clone(),
+                                        success: true,
+                                        output_path: Some(path.clone()),
+                                        error: None,
+                                    };
+                                    match freshness::plan(&issue, m, include_changelog, &path) {
+                                        ExportPlan::Skip => {
                                             info!("Skipping {} (unchanged)", key);
+                                            return unchanged;
                                         }
-                                        return ExportResult {
-                                            issue_key: key,
-                                            success: true,
-                                            output_path: Some(path),
-                                            error: None,
-                                        };
+                                        ExportPlan::BackfillChangelogOnly => {
+                                            // Changelog opt-in is on but the file is
+                                            // missing (e.g. the flag was just enabled);
+                                            // write it without re-fetching the payload.
+                                            backfill_changelog(&client, &key, &path, &issue, json)
+                                                .await;
+                                            return unchanged;
+                                        }
+                                        ExportPlan::Full => {}
                                     }
                                 }
                             }
