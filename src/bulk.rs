@@ -16,6 +16,7 @@ use log::info;
 
 use crate::error::Result;
 use crate::export::{perform_export_with_options, ExportWorkflowOptions};
+use crate::issue::Issue;
 use crate::jira_client::JiraApiClient;
 use crate::manifest::Manifest;
 
@@ -146,10 +147,8 @@ impl BulkExporter {
                         // Incremental check: fetch issue metadata to compare timestamps
                         if let Some(ref m) = manifest_ref {
                             if !force {
-                                if let Ok(issue_data) = client.fetch_issue(&key).await {
-                                    let updated =
-                                        issue_data["fields"]["updated"].as_str().unwrap_or("");
-                                    if !m.is_stale(&key, updated) {
+                                if let Ok(issue) = client.fetch_issue(&key).await {
+                                    if !m.is_stale(&key, &issue.updated) {
                                         let path = output_dir.join(&key);
                                         // Backfill: if changelog opt-in is on but the file
                                         // is missing (e.g. user just enabled the flag),
@@ -162,7 +161,7 @@ impl BulkExporter {
                                                 &client,
                                                 &key,
                                                 &path,
-                                                &issue_data,
+                                                &issue,
                                                 json,
                                             )
                                             .await;
@@ -338,7 +337,7 @@ async fn backfill_changelog(
     client: &JiraApiClient,
     issue_key: &str,
     output_path: &std::path::Path,
-    issue_data: &Value,
+    issue: &Issue,
     include_json: bool,
 ) {
     use crate::changelog;
@@ -357,8 +356,7 @@ async fn backfill_changelog(
         log::warn!("Backfill: failed to create {:?}: {}", output_path, e);
         return;
     }
-    let summary = issue_data["fields"]["summary"].as_str().unwrap_or("");
-    let body = changelog::render_changelog_file(issue_key, summary, &entries, Utc::now());
+    let body = changelog::render_changelog_file(issue_key, &issue.summary, &entries, Utc::now());
     let md_path = output_path.join(format!("{}.changelog.md", issue_key));
     if let Err(e) = tokio::fs::write(&md_path, body).await {
         log::warn!("Backfill: failed to write {:?}: {}", md_path, e);

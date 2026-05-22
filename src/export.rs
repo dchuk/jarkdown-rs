@@ -67,15 +67,12 @@ pub async fn perform_export_with_options(
     // Ensure output directory exists
     tokio::fs::create_dir_all(output_path).await?;
 
-    // Fetch issue data
-    let issue_data = api_client.fetch_issue(issue_key).await?;
+    // Fetch the issue
+    let issue = api_client.fetch_issue(issue_key).await?;
 
     // Download attachments
     let handler = AttachmentHandler::new(api_client);
-    let attachments = issue_data["fields"]["attachment"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let attachments = issue.attachments.clone();
     let downloaded = if options.no_attachments {
         Vec::new()
     } else {
@@ -103,12 +100,11 @@ pub async fn perform_export_with_options(
     let field_filter =
         config_manager.get_field_filter(options.include_fields, options.exclude_fields);
 
-    // Discover child issues for Epics (via JQL) and Ideas (via issue links)
-    let child_issues = {
-        let issue_type = issue_data["fields"]["issuetype"]["name"]
-            .as_str()
-            .unwrap_or("");
-        if issue_type == "Epic" {
+    // Discover child issues for Epics (via JQL) and Ideas (via issue links).
+    // `compose_markdown`'s child-issue section still reads raw `Value`s, so
+    // search hits are unwrapped back to their `raw` payloads here.
+    let child_issues: Vec<Value> = {
+        if issue.issuetype.name == "Epic" {
             // Look up the "Epic Link" field ID for JQL, and also query by parent
             let epic_link_field = field_cache.get_field_id_by_name("Epic Link");
             let mut clauses = vec![format!("parent = {}", issue_key)];
@@ -117,14 +113,14 @@ pub async fn perform_export_with_options(
             }
             let jql = clauses.join(" OR ");
             match api_client.search_jql(&jql, 200).await {
-                Ok(issues) => issues,
+                Ok(results) => results.into_iter().map(|r| r.raw).collect(),
                 Err(e) => {
                     warn!("Failed to fetch child issues for epic: {}", e);
                     Vec::new()
                 }
             }
         } else {
-            extract_delivery_children(&issue_data)
+            extract_delivery_children(&issue.raw)
         }
     };
 
@@ -152,7 +148,7 @@ pub async fn perform_export_with_options(
     let mut cache_opt = Some(field_cache);
     let filter_opt = Some(field_filter);
     let markdown_content = converter.compose_markdown(
-        &issue_data,
+        &issue,
         &downloaded,
         if options.no_attachments {
             &attachments
@@ -168,7 +164,7 @@ pub async fn perform_export_with_options(
     // Write raw JSON (opt-in)
     if options.include_json {
         let json_file = output_path.join(format!("{}.json", issue_key));
-        let json_str = serde_json::to_string_pretty(&issue_data)?;
+        let json_str = serde_json::to_string_pretty(&issue.raw)?;
         tokio::fs::write(&json_file, json_str).await?;
     }
 
@@ -178,8 +174,8 @@ pub async fn perform_export_with_options(
 
     // Write changelog artifacts (opt-in)
     if let Some(entries) = changelog_entries {
-        let summary = issue_data["fields"]["summary"].as_str().unwrap_or("");
-        let body = changelog::render_changelog_file(issue_key, summary, &entries, Utc::now());
+        let body =
+            changelog::render_changelog_file(issue_key, &issue.summary, &entries, Utc::now());
         let changelog_md = output_path.join(format!("{}.changelog.md", issue_key));
         tokio::fs::write(&changelog_md, body).await?;
 

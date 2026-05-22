@@ -6,6 +6,7 @@ use reqwest::{Client, Response, StatusCode};
 use serde_json::Value;
 
 use crate::error::{JarkdownError, Result};
+use crate::issue::{Issue, IssueSearchResult};
 use crate::retry::{retry_with_backoff, RetryConfig};
 
 /// Handles all communication with the Jira Cloud REST API.
@@ -71,8 +72,8 @@ impl JiraApiClient {
         }
     }
 
-    /// Fetch issue data from Jira API.
-    pub async fn fetch_issue(&self, issue_key: &str) -> Result<Value> {
+    /// Fetch a single issue from the Jira API and parse it into a typed [`Issue`].
+    pub async fn fetch_issue(&self, issue_key: &str) -> Result<Issue> {
         let url = format!("{}/issue/{}", self.api_base, issue_key);
         info!("Fetching issue {}...", issue_key);
 
@@ -83,7 +84,8 @@ impl JiraApiClient {
             .send()
             .await?;
 
-        Self::handle_response(response, Some(issue_key)).await
+        let value = Self::handle_response(response, Some(issue_key)).await?;
+        Issue::from_value(value)
     }
 
     /// Fetch all field definitions from Jira.
@@ -108,7 +110,11 @@ impl JiraApiClient {
     }
 
     /// Search for issues matching a JQL query, paginating via nextPageToken.
-    pub async fn search_jql(&self, jql: &str, max_results: u32) -> Result<Vec<Value>> {
+    pub async fn search_jql(
+        &self,
+        jql: &str,
+        max_results: u32,
+    ) -> Result<Vec<IssueSearchResult>> {
         let url = format!("{}/search/jql", self.api_base);
         let mut issues: Vec<Value> = Vec::new();
         let mut next_page_token: Option<String> = None;
@@ -166,7 +172,10 @@ impl JiraApiClient {
             }
         }
         issues.truncate(max_results as usize);
-        Ok(issues)
+        issues
+            .into_iter()
+            .map(IssueSearchResult::from_value)
+            .collect()
     }
 
     /// Get the download URL for an attachment.

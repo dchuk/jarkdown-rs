@@ -11,6 +11,7 @@ use crate::changelog::ChangelogSummary;
 use crate::config::FieldFilter;
 use crate::custom_field::CustomFieldRenderer;
 use crate::field_cache::FieldMetadataCache;
+use crate::issue::Issue;
 
 #[derive(Debug, Clone)]
 struct SkippedAttachment {
@@ -1087,10 +1088,13 @@ impl MarkdownConverter {
     }
 
     /// Compose the final markdown file content.
+    ///
+    /// Accepts the typed [`Issue`]; display-only standard fields are still read
+    /// off `issue.raw` here (typing those is tracked in #13).
     #[allow(clippy::too_many_arguments)]
     pub fn compose_markdown(
         &mut self,
-        issue_data: &Value,
+        issue: &Issue,
         downloaded: &[DownloadedAttachment],
         skipped_attachments: &[Value],
         field_cache: &mut Option<FieldMetadataCache>,
@@ -1098,6 +1102,7 @@ impl MarkdownConverter {
         child_issues: &[Value],
         changelog_summary: Option<&ChangelogSummary>,
     ) -> String {
+        let issue_data = &issue.raw;
         self.prepare_attachment_lookup(downloaded);
         self.prepare_skipped_attachment_lookup(skipped_attachments);
 
@@ -1342,6 +1347,7 @@ fn format_jira_date(created: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::issue::{IssueType, RichText, Status};
     use serde_json::json;
 
     #[test]
@@ -1402,8 +1408,31 @@ mod tests {
         let mut converter =
             MarkdownConverter::new("https://example.atlassian.net", "example.atlassian.net");
 
+        // Construct the typed `Issue` directly as a struct literal — the spine
+        // fields no longer need to be round-tripped through a JSON fixture.
+        let issue = Issue {
+            raw: issue_data,
+            key: "K1".to_string(),
+            summary: "Attachment issue".to_string(),
+            updated: String::new(),
+            issuetype: IssueType {
+                name: "Task".to_string(),
+            },
+            status: Status {
+                name: "Open".to_string(),
+                category: Some("To Do".to_string()),
+            },
+            assignee: None,
+            description: RichText::Empty,
+            comments: Vec::new(),
+            attachments: skipped.clone(),
+            issuelinks: Vec::new(),
+            parent: None,
+            subtasks: Vec::new(),
+        };
+
         let markdown =
-            converter.compose_markdown(&issue_data, &[], &skipped, &mut None, &None, &[], None);
+            converter.compose_markdown(&issue, &[], &skipped, &mut None, &None, &[], None);
 
         assert!(markdown.contains("## Attachments"));
         assert!(markdown.contains(

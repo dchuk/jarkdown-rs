@@ -129,14 +129,10 @@ impl<'a> HierarchyExporter<'a> {
         )
         .await?;
 
-        // Fetch issue data for metadata + child discovery
-        let issue_data = self.api_client.fetch_issue(issue_key).await?;
-        let fields = &issue_data["fields"];
-        let summary = fields["summary"].as_str().unwrap_or("").to_string();
-        let issue_type = fields["issuetype"]["name"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        // Fetch the issue for metadata + child discovery
+        let issue = self.api_client.fetch_issue(issue_key).await?;
+        let summary = issue.summary.clone();
+        let issue_type = issue.issuetype.name.clone();
 
         let mut children = Vec::new();
 
@@ -154,30 +150,26 @@ impl<'a> HierarchyExporter<'a> {
         let mut child_keys: Vec<String> = Vec::new();
 
         // 1. Subtasks from issue data
-        if let Some(subtasks) = fields["subtasks"].as_array() {
-            for st in subtasks {
-                if let Some(k) = st["key"].as_str() {
-                    child_keys.push(k.to_string());
-                }
+        for st in &issue.subtasks {
+            if let Some(k) = st["key"].as_str() {
+                child_keys.push(k.to_string());
             }
         }
 
         // 2. Issue links (e.g. "is parent of", "contains", "is implemented by")
-        if let Some(links) = fields["issuelinks"].as_array() {
-            for link in links {
-                // Outward links where this issue is the parent
-                if let Some(outward) = link["outwardIssue"]["key"].as_str() {
-                    let link_type = link["type"]["outward"].as_str().unwrap_or("");
-                    if is_parent_link_type(link_type) {
-                        child_keys.push(outward.to_string());
-                    }
+        for link in &issue.issuelinks {
+            // Outward links where this issue is the parent
+            if let Some(outward) = link["outwardIssue"]["key"].as_str() {
+                let link_type = link["type"]["outward"].as_str().unwrap_or("");
+                if is_parent_link_type(link_type) {
+                    child_keys.push(outward.to_string());
                 }
-                // Inward links where this issue is the parent
-                if let Some(inward) = link["inwardIssue"]["key"].as_str() {
-                    let link_type = link["type"]["inward"].as_str().unwrap_or("");
-                    if is_parent_link_type(link_type) {
-                        child_keys.push(inward.to_string());
-                    }
+            }
+            // Inward links where this issue is the parent
+            if let Some(inward) = link["inwardIssue"]["key"].as_str() {
+                let link_type = link["type"]["inward"].as_str().unwrap_or("");
+                if is_parent_link_type(link_type) {
+                    child_keys.push(inward.to_string());
                 }
             }
         }
@@ -247,15 +239,12 @@ impl<'a> HierarchyExporter<'a> {
         }
         let jql = clauses.join(" OR ");
 
-        let issues = self
+        let results = self
             .api_client
             .search_jql(&jql, self.options.max_issues)
             .await?;
 
-        Ok(issues
-            .iter()
-            .filter_map(|i| i["key"].as_str().map(|s| s.to_string()))
-            .collect())
+        Ok(results.into_iter().map(|r| r.key).collect())
     }
 
     /// Render the tree as a Markdown index file.

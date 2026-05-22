@@ -17,6 +17,9 @@ pub enum JarkdownError {
     #[error("Issue not found: {0}")]
     IssueNotFound(String),
 
+    #[error("Malformed Jira payload: {0}")]
+    MalformedPayload(String),
+
     #[error("Attachment download error: {message}")]
     AttachmentDownload {
         message: String,

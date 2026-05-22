@@ -13,6 +13,7 @@ use jarkdown::bulk::BulkExporter;
 use jarkdown::cli::{self, Cli, Command};
 use jarkdown::export::{perform_export_with_options, ExportWorkflowOptions};
 use jarkdown::hierarchy::{HierarchyExporter, HierarchyOptions};
+use jarkdown::issue::IssueSearchResult;
 use jarkdown::jira_client::JiraApiClient;
 use jarkdown::manifest::Manifest;
 
@@ -235,9 +236,8 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
     if args.shared.incremental && !args.shared.force {
         let parent_dir = output_path.parent().unwrap_or(std::path::Path::new("."));
         let manifest = Manifest::load(parent_dir);
-        if let Ok(issue_data) = client.fetch_issue(&args.issue_key).await {
-            let updated = issue_data["fields"]["updated"].as_str().unwrap_or("");
-            if !manifest.is_stale(&args.issue_key, updated) {
+        if let Ok(issue) = client.fetch_issue(&args.issue_key).await {
+            if !manifest.is_stale(&args.issue_key, &issue.updated) {
                 info!("Skipping {} (unchanged since last export)", args.issue_key);
                 return;
             }
@@ -277,9 +277,8 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
             if args.shared.incremental {
                 let parent_dir = path.parent().unwrap_or(std::path::Path::new("."));
                 let mut manifest = Manifest::load(parent_dir);
-                if let Ok(issue_data) = client.fetch_issue(&args.issue_key).await {
-                    let updated = issue_data["fields"]["updated"].as_str().unwrap_or("");
-                    manifest.record(&args.issue_key, updated);
+                if let Ok(issue) = client.fetch_issue(&args.issue_key).await {
+                    manifest.record(&args.issue_key, &issue.updated);
                     if let Err(e) = manifest.save(parent_dir) {
                         eprintln!("Warning: Failed to save manifest: {}", e);
                     }
@@ -454,7 +453,8 @@ async fn handle_query(args: jarkdown::cli::QueryArgs) {
 
     let issues_data: HashMap<String, serde_json::Value> = issues
         .into_iter()
-        .filter_map(|i| i["key"].as_str().map(|k| (k.to_string(), i.clone())))
+        .filter(|r| !r.key.is_empty())
+        .map(|r| (r.key.clone(), r.raw))
         .collect();
 
     if let Err(e) = exporter.write_index_md(&all_results, &issues_data).await {
@@ -527,10 +527,11 @@ fn count_nodes(node: &jarkdown::IssueNode) -> usize {
     1 + node.children.iter().map(count_nodes).sum::<usize>()
 }
 
-fn issue_keys_from_search_results(issues: &[serde_json::Value]) -> Vec<String> {
-    issues
+fn issue_keys_from_search_results(results: &[IssueSearchResult]) -> Vec<String> {
+    results
         .iter()
-        .filter_map(|i| i["key"].as_str().map(|s| s.to_string()))
+        .filter(|r| !r.key.is_empty())
+        .map(|r| r.key.clone())
         .collect()
 }
 
@@ -566,9 +567,9 @@ mod tests {
     #[test]
     fn issue_keys_from_search_results_extracts_one_key_per_matching_issue() {
         let issues = vec![
-            json!({"key": "K1"}),
-            json!({"fields": {"summary": "missing key"}}),
-            json!({"key": "K2"}),
+            IssueSearchResult::from_value(json!({"key": "K1"})).unwrap(),
+            IssueSearchResult::from_value(json!({"fields": {"summary": "missing key"}})).unwrap(),
+            IssueSearchResult::from_value(json!({"key": "K2"})).unwrap(),
         ];
 
         assert_eq!(issue_keys_from_search_results(&issues), vec!["K1", "K2"]);
