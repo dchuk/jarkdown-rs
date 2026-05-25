@@ -124,6 +124,10 @@ jarkdown-rs export EPIC-123 --hierarchy --max-depth 3 --max-issues 500
 jarkdown-rs bulk EPIC-1 EPIC-2 --hierarchy
 jarkdown-rs query 'type = Epic AND project = FOO' --hierarchy
 
+# Export the full Jira changelog (audit trail of field changes) as a sibling file
+jarkdown-rs export PROJ-123 --include-changelog
+jarkdown-rs bulk PROJ-1 PROJ-2 PROJ-3 --include-changelog --incremental
+
 # Print matching keys without exporting files
 jarkdown-rs query 'project = FOO AND status = Done' --keys-only
 
@@ -158,6 +162,7 @@ jarkdown-rs export PROJ-123 --verbose
 | `--hierarchy` | all | off |
 | `--max-depth` | all (with `--hierarchy`) | 2 |
 | `--max-issues` | all (with `--hierarchy`) | 200 |
+| `--include-changelog` | all | off (writes `{KEY}.changelog.md`; see [ADR-0001](docs/adr/0001-changelog-export.md)) |
 | `--keys-only` | query | off |
 
 ## Output Structure
@@ -180,6 +185,24 @@ PROJ-123/
 ├── screenshot.png
 └── design-doc.pdf
 ```
+
+### With `--include-changelog`
+
+The changelog (Jira's audit trail of field changes) is exported as a sibling
+file rather than inlined, so long-lived issues don't drown out the description.
+The main `.md` cross-references it via a `changelog:` frontmatter key and a
+`## Changelog` section. See [ADR-0001](docs/adr/0001-changelog-export.md) for
+the rationale and the one-time backfill behaviour under `--incremental`.
+
+```
+PROJ-123/
+├── PROJ-123.md
+├── PROJ-123.changelog.md
+└── screenshot.png
+```
+
+With `--include-json` set as well, the changelog also lands in a parallel
+`PROJ-123.changelog.json` rather than being merged into `PROJ-123.json`.
 
 ### Bulk / Query Export
 
@@ -295,6 +318,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Library access to `--include-changelog`
+
+The high-level `ExportOptions` deliberately stays minimal. To opt into the
+changelog from library code, drop one level down to
+`perform_export_with_options` and pass `include_changelog: true`:
+
+```rust
+use jarkdown::{JiraApiClient, perform_export_with_options, ExportWorkflowOptions};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = JiraApiClient::new("company.atlassian.net", "user@example.com", "token")?;
+
+    perform_export_with_options(
+        &client,
+        "PROJ-123",
+        std::path::Path::new("./exports/PROJ-123"),
+        ExportWorkflowOptions {
+            include_changelog: true,
+            include_json: true, // also writes PROJ-123.changelog.json
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+```
+
+`BulkExporter` exposes the same flag via the `.with_include_changelog(true)`
+builder method (see the bulk example below).
+
 ### Bulk export via library
 
 ```rust
@@ -360,8 +414,9 @@ In `--hierarchy` mode, jarkdown-rs follows the full chain: Idea → Epics → St
 
 - [x] Parallel attachment downloads (`--attachment-concurrency`)
 - [x] Incremental/delta export (`--incremental`)
-- [ ] Alternative output formats (PDF, HTML, Confluence wiki)
 - [x] Hierarchical export — epics and JPD ideas with child issues (`--hierarchy` flag)
+- [x] Full changelog export — audit trail of field changes (`--include-changelog` flag)
+- [ ] Alternative output formats (PDF, HTML, Confluence wiki)
 
 ## Contributing
 
@@ -374,6 +429,18 @@ cargo clippy -- -D warnings
 ```
 
 PRs welcome! Please ensure `cargo clippy` and `cargo test` pass before submitting.
+
+### Internal docs
+
+- [`docs/architecture.md`](docs/architecture.md) — layered architecture with
+  MermaidJS diagrams for the overall system, single-issue export flow, bulk
+  concurrency, hierarchy traversal, the incremental-freshness state machine,
+  the pure render pipeline, the typed/raw `Issue` duality, and the attachment
+  pipeline.
+- [`CONTEXT.md`](CONTEXT.md) — domain glossary (Issue, Changelog, Comment,
+  Worklog) and the terms code/docs should standardize on.
+- [`docs/adr/`](docs/adr/) — Architecture Decision Records covering
+  non-obvious design choices (changelog export shape, typed `Issue` model).
 
 ## License
 

@@ -2,6 +2,10 @@
 
 A Rust CLI and library that exports Jira Cloud issues to local Markdown files, preserving content, attachments, and metadata for offline use.
 
+For how the code is layered (with MermaidJS diagrams of every key flow), see
+[`docs/architecture.md`](docs/architecture.md). For non-obvious design
+decisions, see [`docs/adr/`](docs/adr/).
+
 ## Language
 
 **Issue**:
