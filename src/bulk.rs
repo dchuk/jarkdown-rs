@@ -20,7 +20,7 @@ use crate::freshness::{self, ExportPlan, PlanOptions};
 use crate::jira_client::{JiraApiClient, ValidationIssue};
 use crate::manifest::{
     default_manifest_path, export_option_fingerprint, normalize_issue_key, relative_artifact_path,
-    Manifest,
+    ExportFingerprintOptions, Manifest,
 };
 
 /// Result of a single issue export attempt.
@@ -208,8 +208,23 @@ impl BulkExporter {
                 let manifest_ref = manifest.clone();
                 let force = self.force;
                 let include_changelog = self.include_changelog;
-                let option_fingerprint =
-                    export_option_fingerprint(inc.as_deref(), exc.as_deref(), no_attachments);
+                let option_fingerprint = export_option_fingerprint(ExportFingerprintOptions {
+                    include_fields: inc.as_deref(),
+                    exclude_fields: exc.as_deref(),
+                    no_attachments,
+                    include_json: json,
+                    include_changelog,
+                    ..ExportFingerprintOptions::default()
+                });
+                let option_fingerprint_without_changelog =
+                    export_option_fingerprint(ExportFingerprintOptions {
+                        include_fields: inc.as_deref(),
+                        exclude_fields: exc.as_deref(),
+                        no_attachments,
+                        include_json: json,
+                        include_changelog: false,
+                        ..ExportFingerprintOptions::default()
+                    });
                 let validation = validation.clone();
                 let validation_succeeded = validation_succeeded;
 
@@ -243,6 +258,8 @@ impl BulkExporter {
                                             include_changelog,
                                             include_json: json,
                                             option_fingerprint: option_fingerprint.as_deref(),
+                                            option_fingerprint_without_changelog:
+                                                option_fingerprint_without_changelog.as_deref(),
                                         },
                                         &path,
                                     ) {
@@ -395,11 +412,15 @@ impl BulkExporter {
                                 .as_ref()
                                 .map(|path| relative_artifact_path(&self.output_dir, path))
                                 .unwrap_or_else(|| r.issue_key.clone());
-                            let option_fingerprint = export_option_fingerprint(
-                                self.include_fields.as_deref(),
-                                self.exclude_fields.as_deref(),
-                                self.no_attachments,
-                            );
+                            let option_fingerprint =
+                                export_option_fingerprint(ExportFingerprintOptions {
+                                    include_fields: self.include_fields.as_deref(),
+                                    exclude_fields: self.exclude_fields.as_deref(),
+                                    no_attachments: self.no_attachments,
+                                    include_json: self.include_json,
+                                    include_changelog: self.include_changelog,
+                                    ..ExportFingerprintOptions::default()
+                                });
                             manifest.record_issue_with_fingerprint(
                                 &issue,
                                 artifact_path,

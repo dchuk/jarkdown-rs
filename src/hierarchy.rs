@@ -4,7 +4,7 @@
 //! JPD delivery links ("is implemented by"), and exports everything
 //! into a tree-structured directory.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -61,7 +61,8 @@ pub struct HierarchyExporter<'a> {
     api_client: &'a JiraApiClient,
     exporter: &'a dyn IssueExporter,
     options: HierarchyOptions,
-    visited: HashSet<String>,
+    recursion_stack: HashSet<String>,
+    emitted_nodes: HashMap<String, IssueNode>,
     issue_count: u32,
 }
 
@@ -75,7 +76,8 @@ impl<'a> HierarchyExporter<'a> {
             api_client,
             exporter,
             options,
-            visited: HashSet::new(),
+            recursion_stack: HashSet::new(),
+            emitted_nodes: HashMap::new(),
             issue_count: 0,
         }
     }
@@ -133,10 +135,14 @@ impl<'a> HierarchyExporter<'a> {
         depth: u32,
         epic_link_field: Option<&str>,
     ) -> Result<IssueNode> {
-        // Cycle detection
-        if self.visited.contains(issue_key) {
+        let canonical_key = issue_key.trim().to_ascii_uppercase();
+        // Cycle detection only rejects an Issue already on the current
+        // ancestor path. A repeated non-cyclic shared child is re-emitted below
+        // so the caller can record the second edge/path without re-fetching
+        // children.
+        if self.recursion_stack.contains(&canonical_key) {
             return Ok(IssueNode {
-                key: issue_key.to_string(),
+                key: canonical_key,
                 summary: "(already visited)".to_string(),
                 issue_type: String::new(),
                 updated: String::new(),
@@ -146,15 +152,36 @@ impl<'a> HierarchyExporter<'a> {
                 children: Vec::new(),
             });
         }
-        self.visited.insert(issue_key.to_string());
+        if let Some(cached) = self.emitted_nodes.get(&canonical_key).cloned() {
+            let issue_dir = self.issue_output_dir(output_dir, &canonical_key);
+            self.exporter.export(&canonical_key, &issue_dir).await?;
+            return Ok(IssueNode {
+                children_discovered: false,
+                truncated: false,
+                failures: Vec::new(),
+                children: Vec::new(),
+                ..cached
+            });
+        }
+
+        self.recursion_stack.insert(canonical_key.clone());
         self.issue_count += 1;
 
         // Export this issue
-        let issue_dir = self.issue_output_dir(output_dir, issue_key);
-        self.exporter.export(issue_key, &issue_dir).await?;
+        let issue_dir = self.issue_output_dir(output_dir, &canonical_key);
+        if let Err(e) = self.exporter.export(&canonical_key, &issue_dir).await {
+            self.recursion_stack.remove(&canonical_key);
+            return Err(e);
+        }
 
         // Fetch the issue for metadata + child discovery
-        let issue = self.api_client.fetch_issue(issue_key).await?;
+        let issue = match self.api_client.fetch_issue(&canonical_key).await {
+            Ok(issue) => issue,
+            Err(e) => {
+                self.recursion_stack.remove(&canonical_key);
+                return Err(e);
+            }
+        };
         let summary = issue.summary.clone();
         let issue_type = issue.issuetype.name.clone();
         let updated = issue.updated.clone();
@@ -166,16 +193,20 @@ impl<'a> HierarchyExporter<'a> {
 
         // Stop recursing if we've hit max depth or max issues
         if depth >= self.options.max_depth || self.issue_count >= self.options.max_issues {
-            return Ok(IssueNode {
-                key: issue_key.to_string(),
+            let node = IssueNode {
+                key: canonical_key.clone(),
                 summary,
                 issue_type,
                 updated,
                 children_discovered,
-                truncated: self.issue_count >= self.options.max_issues,
+                truncated: true,
                 failures,
                 children,
-            });
+            };
+            self.emitted_nodes
+                .insert(canonical_key.clone(), node.clone());
+            self.recursion_stack.remove(&canonical_key);
+            return Ok(node);
         }
 
         // Discover children from multiple sources
@@ -207,17 +238,17 @@ impl<'a> HierarchyExporter<'a> {
         }
 
         // 3. JQL search for children (parent = KEY or "Epic Link" = KEY)
-        let child_discovery_complete = match self.search_children(issue_key, epic_link_field).await
-        {
-            Ok(jql_children) => {
-                child_keys.extend(jql_children);
-                true
-            }
-            Err(e) => {
-                warn!("Failed to discover JQL children for {}: {}", issue_key, e);
-                false
-            }
-        };
+        let child_discovery_complete =
+            match self.search_children(&canonical_key, epic_link_field).await {
+                Ok(jql_children) => {
+                    child_keys.extend(jql_children);
+                    true
+                }
+                Err(e) => {
+                    warn!("Failed to discover JQL children for {}: {}", issue_key, e);
+                    false
+                }
+            };
 
         // Deduplicate while preserving order
         let mut seen = HashSet::new();
@@ -237,7 +268,7 @@ impl<'a> HierarchyExporter<'a> {
             match self
                 .build_tree(
                     child_key,
-                    &self.child_base_dir(output_dir, issue_key),
+                    &self.child_base_dir(output_dir, &canonical_key),
                     depth + 1,
                     epic_link_field,
                 )
@@ -254,8 +285,8 @@ impl<'a> HierarchyExporter<'a> {
             }
         }
 
-        Ok(IssueNode {
-            key: issue_key.to_string(),
+        let node = IssueNode {
+            key: canonical_key.clone(),
             summary,
             issue_type,
             updated,
@@ -263,7 +294,11 @@ impl<'a> HierarchyExporter<'a> {
             truncated,
             failures,
             children,
-        })
+        };
+        self.emitted_nodes
+            .insert(canonical_key.clone(), node.clone());
+        self.recursion_stack.remove(&canonical_key);
+        Ok(node)
     }
 
     /// Resolve the custom field ID for "Epic Link" by reverse-looking up the field name.
@@ -315,7 +350,7 @@ impl<'a> HierarchyExporter<'a> {
             String::new(),
             format!(
                 "Exported {} issues with max depth {}.",
-                self.visited.len(),
+                self.emitted_nodes.len(),
                 self.options.max_depth
             ),
             String::new(),
@@ -659,6 +694,7 @@ mod tests {
     /// `Issue::from_value` accepts. JQL search always returns no children.
     struct ScriptedJiraServer {
         base_url: String,
+        requests: Arc<Mutex<Vec<String>>>,
     }
 
     impl ScriptedJiraServer {
@@ -675,16 +711,22 @@ mod tests {
             let base_url = format!("http://{}", addr);
             let graph = Arc::new(graph);
             let not_found = Arc::new(not_found);
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let thread_requests = requests.clone();
 
             thread::spawn(move || {
                 for stream in listener.incoming().flatten() {
                     let g = graph.clone();
                     let nf = not_found.clone();
-                    handle_scripted_request(stream, g, nf);
+                    handle_scripted_request(stream, g, nf, &thread_requests);
                 }
             });
 
-            Self { base_url }
+            Self { base_url, requests }
+        }
+
+        fn observed_paths(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
         }
     }
 
@@ -692,6 +734,7 @@ mod tests {
         mut stream: TcpStream,
         graph: Arc<HashMap<String, Vec<String>>>,
         not_found: Arc<HashSet<String>>,
+        requests: &Arc<Mutex<Vec<String>>>,
     ) {
         let mut buffer = [0; 8192];
         let bytes_read = stream.read(&mut buffer).expect("read request");
@@ -702,6 +745,7 @@ mod tests {
             .and_then(|line| line.split_whitespace().nth(1))
             .unwrap_or("/")
             .to_string();
+        requests.lock().unwrap().push(path.clone());
 
         let (status, body) = if let Some(key) = parse_issue_key(&path) {
             if not_found.contains(&key) {
@@ -771,9 +815,10 @@ mod tests {
             r#"{{
             "key": "{}",
             "renderedFields": {{}},
-            "fields": {{
-                "summary": "Issue {}",
-                "issuetype": {{ "name": "Task" }},
+                "fields": {{
+                    "summary": "Issue {}",
+                    "updated": "2026-01-01T00:00:00.000+0000",
+                    "issuetype": {{ "name": "Task" }},
                 "status": {{ "name": "Open", "statusCategory": {{ "name": "To Do" }} }},
                 "priority": {{ "name": "Medium" }},
                 "resolution": null,
@@ -881,6 +926,74 @@ mod tests {
             !default_manifest_path(&output_dir).exists(),
             "non-incremental corpus hierarchy export must not persist a manifest"
         );
+
+        std::fs::remove_dir_all(output_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn shared_non_cyclic_child_is_reemitted_without_duplicate_child_fetch() {
+        let mut graph = HashMap::new();
+        graph.insert("A".to_string(), vec!["B".to_string(), "C".to_string()]);
+        graph.insert("B".to_string(), vec!["D".to_string()]);
+        graph.insert("C".to_string(), vec!["D".to_string()]);
+        graph.insert("D".to_string(), vec![]);
+
+        let server = ScriptedJiraServer::start(graph);
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let output_dir = unique_temp_dir("jarkdown-shared-child");
+        let mut options = default_hierarchy_options(5, 20);
+        options.layout = HierarchyLayout::Nested;
+        let fake = RecordingExporter::default();
+
+        let mut exporter = HierarchyExporter::new(&client, &fake, options);
+        let tree = exporter
+            .export_hierarchy("A", &output_dir)
+            .await
+            .expect("hierarchy export");
+
+        assert_eq!(tree.children.len(), 2);
+        let calls = fake.calls();
+        assert_eq!(
+            calls.iter().filter(|key| key.as_str() == "D").count(),
+            2,
+            "shared child must be emitted to both nested artifact paths"
+        );
+        assert_eq!(
+            server
+                .observed_paths()
+                .iter()
+                .filter(|path| path.starts_with("/rest/api/3/issue/D"))
+                .count(),
+            1,
+            "shared child should be fetched exactly once"
+        );
+        assert!(fake
+            .dirs()
+            .contains(&output_dir.join("A").join("B").join("D")));
+        assert!(fake
+            .dirs()
+            .contains(&output_dir.join("A").join("C").join("D")));
+        let mut manifest = crate::manifest::Manifest::default();
+        manifest.record_hierarchy(&tree, "index.md", HierarchyLayout::Nested, None);
+        assert!(
+            manifest
+                .edges
+                .iter()
+                .any(|edge| edge.parent == "B" && edge.child == "D" && edge.active),
+            "edges: {:?}",
+            manifest.edges
+        );
+        assert!(
+            manifest
+                .edges
+                .iter()
+                .any(|edge| edge.parent == "C" && edge.child == "D" && edge.active),
+            "edges: {:?}",
+            manifest.edges
+        );
+        let mut d_paths = manifest.active_artifact_paths("D");
+        d_paths.sort();
+        assert_eq!(d_paths, vec!["A/B/D".to_string(), "A/C/D".to_string()]);
 
         std::fs::remove_dir_all(output_dir).ok();
     }

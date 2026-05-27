@@ -17,7 +17,8 @@ use jarkdown::hierarchy::{HierarchyExporter, HierarchyLayout, HierarchyOptions};
 use jarkdown::issue::IssueSearchResult;
 use jarkdown::jira_client::{JiraApiClient, ValidationIssue};
 use jarkdown::manifest::{
-    default_manifest_path, export_option_fingerprint, relative_artifact_path, Manifest,
+    default_manifest_path, export_option_fingerprint, relative_artifact_path,
+    sanitize_artifact_path, ExportFingerprintOptions, Manifest,
 };
 
 /// Load and validate Jira credentials from environment variables.
@@ -236,10 +237,9 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
         });
     let output_root = output_path.parent().unwrap_or(std::path::Path::new("."));
     let manifest_path = manifest_path_for_output(output_root, &args.shared);
-    let option_fingerprint = export_option_fingerprint(
-        args.shared.include_fields.as_deref(),
-        args.shared.exclude_fields.as_deref(),
-        args.shared.no_attachments,
+    let option_fingerprint = export_option_fingerprint(fingerprint_options(&args.shared, false));
+    let option_fingerprint_without_changelog = export_option_fingerprint(
+        fingerprint_options_with_changelog(&args.shared, false, false),
     );
     let mut manifest = if args.shared.incremental {
         match Manifest::load_from_path(&manifest_path) {
@@ -285,6 +285,8 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
                     include_changelog: args.shared.include_changelog,
                     include_json: args.shared.include_json,
                     option_fingerprint: option_fingerprint.as_deref(),
+                    option_fingerprint_without_changelog: option_fingerprint_without_changelog
+                        .as_deref(),
                 },
                 &output_path,
             ) {
@@ -654,11 +656,9 @@ async fn run_hierarchy_export_with_validation(
     };
 
     let manifest_path = manifest_path_for_output(output_dir, shared);
-    let option_fingerprint = export_option_fingerprint(
-        shared.include_fields.as_deref(),
-        shared.exclude_fields.as_deref(),
-        shared.no_attachments,
-    );
+    let option_fingerprint = export_option_fingerprint(fingerprint_options(shared, true));
+    let option_fingerprint_without_changelog =
+        export_option_fingerprint(fingerprint_options_with_changelog(shared, true, false));
     if shared.incremental && !shared.force {
         let warm_result = match options.layout {
             HierarchyLayout::Corpus => {
@@ -669,6 +669,7 @@ async fn run_hierarchy_export_with_validation(
                     shared,
                     &manifest_path,
                     option_fingerprint.as_deref(),
+                    option_fingerprint_without_changelog.as_deref(),
                     validation_plan,
                 )
                 .await
@@ -681,6 +682,7 @@ async fn run_hierarchy_export_with_validation(
                     shared,
                     &manifest_path,
                     option_fingerprint.as_deref(),
+                    option_fingerprint_without_changelog.as_deref(),
                     validation_plan,
                 )
                 .await
@@ -785,6 +787,7 @@ async fn try_warm_corpus_hierarchy_skip(
     shared: &jarkdown::cli::SharedArgs,
     manifest_path: &std::path::Path,
     option_fingerprint: Option<&str>,
+    option_fingerprint_without_changelog: Option<&str>,
     validation_plan: Option<&HashMap<String, ValidationIssue>>,
 ) -> jarkdown::Result<Option<jarkdown::IssueNode>> {
     let mut manifest = Manifest::load_from_path(manifest_path)?;
@@ -805,11 +808,24 @@ async fn try_warm_corpus_hierarchy_skip(
             .map(|issue| (normalize_issue_key_local(&issue.key), issue))
             .collect::<HashMap<_, _>>(),
     };
-    if keys.iter().any(|key| !validation.contains_key(key)) {
-        return Ok(None);
+    let missing_keys: Vec<String> = keys
+        .iter()
+        .filter(|key| !validation.contains_key(*key))
+        .cloned()
+        .collect();
+    for key in &missing_keys {
+        manifest.evict(key, "not_returned_by_validation_search");
+    }
+    let keys: Vec<String> = keys
+        .into_iter()
+        .filter(|key| validation.contains_key(key))
+        .collect();
+    if keys.is_empty() {
+        manifest.save_to_path(manifest_path)?;
+        return Ok(manifest.cached_hierarchy_tree(issue_key));
     }
 
-    let mut refresh_keys = Vec::new();
+    let mut refresh_plans = Vec::new();
     for key in &keys {
         let Some(issue) = validation.get(key) else {
             return Ok(None);
@@ -822,6 +838,7 @@ async fn try_warm_corpus_hierarchy_skip(
                 include_changelog: shared.include_changelog,
                 include_json: shared.include_json,
                 option_fingerprint,
+                option_fingerprint_without_changelog,
             },
             &output_dir.join(key),
         );
@@ -830,18 +847,18 @@ async fn try_warm_corpus_hierarchy_skip(
             ExportPlan::Full
                 if normalize_issue_key_local(key) != normalize_issue_key_local(issue_key) =>
             {
-                refresh_keys.push(key.clone());
+                refresh_plans.push((key.clone(), ExportPlan::Full));
             }
             ExportPlan::BackfillChangelogOnly
                 if normalize_issue_key_local(key) != normalize_issue_key_local(issue_key) =>
             {
-                refresh_keys.push(key.clone());
+                refresh_plans.push((key.clone(), ExportPlan::BackfillChangelogOnly));
             }
             ExportPlan::Full | ExportPlan::BackfillChangelogOnly => return Ok(None),
         }
     }
 
-    if !refresh_keys.is_empty() {
+    if !refresh_plans.is_empty() {
         refresh_changed_corpus_descendants(
             client,
             issue_key,
@@ -849,7 +866,7 @@ async fn try_warm_corpus_hierarchy_skip(
             shared,
             &mut manifest,
             &validation,
-            &refresh_keys,
+            &refresh_plans,
             option_fingerprint,
         )
         .await?;
@@ -880,7 +897,7 @@ async fn refresh_changed_corpus_descendants(
     shared: &jarkdown::cli::SharedArgs,
     manifest: &mut Manifest,
     validation: &HashMap<String, jarkdown::jira_client::ValidationIssue>,
-    refresh_keys: &[String],
+    refresh_plans: &[(String, ExportPlan)],
     option_fingerprint: Option<&str>,
 ) -> jarkdown::Result<()> {
     let workflow_options = ExportWorkflowOptions {
@@ -897,11 +914,11 @@ async fn refresh_changed_corpus_descendants(
         options: workflow_options.clone(),
     };
 
-    let refresh_set: std::collections::HashSet<_> = refresh_keys
+    let refresh_set: std::collections::HashSet<_> = refresh_plans
         .iter()
-        .map(|key| normalize_issue_key_local(key))
+        .map(|(key, _)| normalize_issue_key_local(key))
         .collect();
-    for key in refresh_keys {
+    for (key, plan) in refresh_plans {
         let normalized_key = normalize_issue_key_local(key);
         if refresh_set.iter().any(|other| {
             other != &normalized_key && manifest.is_descendant_of(other, &normalized_key)
@@ -909,11 +926,39 @@ async fn refresh_changed_corpus_descendants(
             continue;
         }
 
-        if manifest.has_active_children(&normalized_key) {
-            let mut options = HierarchyOptions {
-                max_depth: shared
-                    .max_depth
-                    .min(manifest.max_cached_descendant_depth(&normalized_key)),
+        if *plan == ExportPlan::BackfillChangelogOnly {
+            if let Some(issue) = validation.get(&normalized_key) {
+                let path = output_dir.join(&normalized_key);
+                let summary = issue
+                    .summary
+                    .as_deref()
+                    .or_else(|| {
+                        manifest
+                            .get(&normalized_key)
+                            .and_then(|entry| entry.summary.as_deref())
+                    })
+                    .unwrap_or(&normalized_key);
+                backfill_changelog_with_summary(
+                    client,
+                    &normalized_key,
+                    summary,
+                    &path,
+                    shared.include_json,
+                )
+                .await;
+                manifest.record_metadata_with_fingerprint(
+                    &issue.key,
+                    &issue.updated,
+                    issue.summary.as_deref(),
+                    issue.issue_type.as_deref(),
+                    issue.status.as_deref(),
+                    &normalized_key,
+                    option_fingerprint,
+                );
+            }
+        } else if manifest.has_active_children(&normalized_key) {
+            let options = HierarchyOptions {
+                max_depth: manifest.remaining_depth_for_refresh(&normalized_key, shared.max_depth),
                 max_issues: shared.max_issues,
                 refresh_fields: shared.refresh_fields,
                 include_fields: shared.include_fields.clone(),
@@ -924,9 +969,6 @@ async fn refresh_changed_corpus_descendants(
                 include_changelog: shared.include_changelog,
                 layout: HierarchyLayout::Corpus,
             };
-            if options.max_depth == 0 {
-                options.max_depth = 1;
-            }
             let mut exporter = HierarchyExporter::new(client, &workflow_exporter, options);
             let subtree = exporter.export_subtree(&normalized_key, output_dir).await?;
             manifest.record_hierarchy_members(root_key, &subtree, option_fingerprint);
@@ -961,6 +1003,7 @@ async fn try_warm_nested_hierarchy_skip(
     shared: &jarkdown::cli::SharedArgs,
     manifest_path: &std::path::Path,
     option_fingerprint: Option<&str>,
+    option_fingerprint_without_changelog: Option<&str>,
     validation_plan: Option<&HashMap<String, ValidationIssue>>,
 ) -> jarkdown::Result<Option<jarkdown::IssueNode>> {
     let mut manifest = Manifest::load_from_path(manifest_path)?;
@@ -981,11 +1024,24 @@ async fn try_warm_nested_hierarchy_skip(
             .map(|issue| (normalize_issue_key_local(&issue.key), issue))
             .collect::<HashMap<_, _>>(),
     };
-    if keys.iter().any(|key| !validation.contains_key(key)) {
-        return Ok(None);
+    let missing_keys: Vec<String> = keys
+        .iter()
+        .filter(|key| !validation.contains_key(*key))
+        .cloned()
+        .collect();
+    for key in &missing_keys {
+        manifest.evict(key, "not_returned_by_validation_search");
+    }
+    let keys: Vec<String> = keys
+        .into_iter()
+        .filter(|key| validation.contains_key(key))
+        .collect();
+    if keys.is_empty() {
+        manifest.save_to_path(manifest_path)?;
+        return Ok(manifest.cached_hierarchy_tree(issue_key));
     }
 
-    let mut refresh_keys = Vec::new();
+    let mut refresh_plans = Vec::new();
     for key in &keys {
         let Some(issue) = validation.get(key) else {
             return Ok(None);
@@ -995,6 +1051,9 @@ async fn try_warm_nested_hierarchy_skip(
             return Ok(None);
         }
         let needs_refresh = paths.iter().any(|path| {
+            let Some(path) = artifact_output_path(output_dir, path) else {
+                return true;
+            };
             freshness::plan_metadata(
                 key,
                 &issue.updated,
@@ -1003,19 +1062,39 @@ async fn try_warm_nested_hierarchy_skip(
                     include_changelog: shared.include_changelog,
                     include_json: shared.include_json,
                     option_fingerprint,
+                    option_fingerprint_without_changelog,
                 },
-                &output_dir.join(path),
+                &path,
             ) != ExportPlan::Skip
         });
         if needs_refresh {
             if normalize_issue_key_local(key) == normalize_issue_key_local(issue_key) {
                 return Ok(None);
             }
-            refresh_keys.push(key.clone());
+            let plan = paths
+                .iter()
+                .filter_map(|path| artifact_output_path(output_dir, path))
+                .map(|path| {
+                    freshness::plan_metadata(
+                        key,
+                        &issue.updated,
+                        &manifest,
+                        PlanOptions {
+                            include_changelog: shared.include_changelog,
+                            include_json: shared.include_json,
+                            option_fingerprint,
+                            option_fingerprint_without_changelog,
+                        },
+                        &path,
+                    )
+                })
+                .find(|plan| *plan == ExportPlan::Full)
+                .unwrap_or(ExportPlan::BackfillChangelogOnly);
+            refresh_plans.push((key.clone(), plan));
         }
     }
 
-    if !refresh_keys.is_empty() {
+    if !refresh_plans.is_empty() {
         refresh_changed_nested_descendants(
             client,
             issue_key,
@@ -1023,7 +1102,7 @@ async fn try_warm_nested_hierarchy_skip(
             shared,
             &mut manifest,
             &validation,
-            &refresh_keys,
+            &refresh_plans,
             option_fingerprint,
         )
         .await?;
@@ -1042,7 +1121,7 @@ async fn refresh_changed_nested_descendants(
     shared: &jarkdown::cli::SharedArgs,
     manifest: &mut Manifest,
     validation: &HashMap<String, jarkdown::jira_client::ValidationIssue>,
-    refresh_keys: &[String],
+    refresh_plans: &[(String, ExportPlan)],
     option_fingerprint: Option<&str>,
 ) -> jarkdown::Result<()> {
     let workflow_options = ExportWorkflowOptions {
@@ -1059,11 +1138,11 @@ async fn refresh_changed_nested_descendants(
         options: workflow_options.clone(),
     };
 
-    let refresh_set: std::collections::HashSet<_> = refresh_keys
+    let refresh_set: std::collections::HashSet<_> = refresh_plans
         .iter()
-        .map(|key| normalize_issue_key_local(key))
+        .map(|(key, _)| normalize_issue_key_local(key))
         .collect();
-    for key in refresh_keys {
+    for (key, plan) in refresh_plans {
         let normalized_key = normalize_issue_key_local(key);
         if refresh_set.iter().any(|other| {
             other != &normalized_key && manifest.is_descendant_of(other, &normalized_key)
@@ -1072,11 +1151,46 @@ async fn refresh_changed_nested_descendants(
         }
 
         let paths = manifest.active_artifact_paths(&normalized_key);
-        if manifest.has_active_children(&normalized_key) {
-            let mut options = HierarchyOptions {
-                max_depth: shared
-                    .max_depth
-                    .min(manifest.max_cached_descendant_depth(&normalized_key)),
+        if *plan == ExportPlan::BackfillChangelogOnly {
+            if let Some(issue) = validation.get(&normalized_key) {
+                for path in &paths {
+                    let Some(path) = artifact_output_path(output_dir, path) else {
+                        continue;
+                    };
+                    let summary = issue
+                        .summary
+                        .as_deref()
+                        .or_else(|| {
+                            manifest
+                                .get(&normalized_key)
+                                .and_then(|entry| entry.summary.as_deref())
+                        })
+                        .unwrap_or(&normalized_key);
+                    backfill_changelog_with_summary(
+                        client,
+                        &normalized_key,
+                        summary,
+                        &path,
+                        shared.include_json,
+                    )
+                    .await;
+                    manifest.record_hierarchy_metadata_with_fingerprint(
+                        &issue.key,
+                        &issue.updated,
+                        issue.summary.as_deref(),
+                        issue.issue_type.as_deref(),
+                        issue.status.as_deref(),
+                        path.strip_prefix(output_dir)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .to_string(),
+                        option_fingerprint,
+                    );
+                }
+            }
+        } else if manifest.has_active_children(&normalized_key) {
+            let options = HierarchyOptions {
+                max_depth: manifest.remaining_depth_for_refresh(&normalized_key, shared.max_depth),
                 max_issues: shared.max_issues,
                 refresh_fields: shared.refresh_fields,
                 include_fields: shared.include_fields.clone(),
@@ -1087,9 +1201,6 @@ async fn refresh_changed_nested_descendants(
                 include_changelog: shared.include_changelog,
                 layout: HierarchyLayout::Nested,
             };
-            if options.max_depth == 0 {
-                options.max_depth = 1;
-            }
             for path in &paths {
                 let base = nested_refresh_base(output_dir, path, &normalized_key);
                 let mut exporter =
@@ -1105,10 +1216,13 @@ async fn refresh_changed_nested_descendants(
             }
         } else if let Some(issue) = validation.get(&normalized_key) {
             for path in &paths {
+                let Some(output_path) = artifact_output_path(output_dir, path) else {
+                    continue;
+                };
                 perform_export_with_options(
                     client,
                     &normalized_key,
-                    &output_dir.join(path),
+                    &output_path,
                     workflow_options.clone(),
                 )
                 .await?;
@@ -1146,6 +1260,41 @@ fn nested_refresh_base(
     parts
         .into_iter()
         .fold(output_dir.to_path_buf(), |path, part| path.join(part))
+}
+
+fn artifact_output_path(output_dir: &std::path::Path, artifact_path: &str) -> Option<PathBuf> {
+    sanitize_artifact_path(artifact_path).map(|path| output_dir.join(path))
+}
+
+async fn backfill_changelog_with_summary(
+    client: &JiraApiClient,
+    issue_key: &str,
+    summary: &str,
+    output_path: &std::path::Path,
+    include_json: bool,
+) {
+    match client.fetch_changelog(issue_key).await {
+        Ok(entries) => {
+            if let Err(e) = jarkdown::changelog::write_artifacts(
+                issue_key,
+                summary,
+                &entries,
+                output_path,
+                include_json,
+            )
+            .await
+            {
+                eprintln!(
+                    "Warning: changelog backfill failed for {}: {}",
+                    issue_key, e
+                );
+            }
+        }
+        Err(e) => eprintln!(
+            "Warning: changelog backfill fetch failed for {}: {}",
+            issue_key, e
+        ),
+    }
 }
 
 async fn build_hierarchy_validation_plan(
@@ -1212,6 +1361,29 @@ fn hierarchy_layout(shared: &jarkdown::cli::SharedArgs) -> HierarchyLayout {
         Some(jarkdown::cli::HierarchyLayoutArg::Nested) => HierarchyLayout::Nested,
         None if shared.incremental => HierarchyLayout::Corpus,
         None => HierarchyLayout::Nested,
+    }
+}
+
+fn fingerprint_options(
+    shared: &jarkdown::cli::SharedArgs,
+    hierarchy: bool,
+) -> ExportFingerprintOptions<'_> {
+    fingerprint_options_with_changelog(shared, hierarchy, shared.include_changelog)
+}
+
+fn fingerprint_options_with_changelog(
+    shared: &jarkdown::cli::SharedArgs,
+    hierarchy: bool,
+    include_changelog: bool,
+) -> ExportFingerprintOptions<'_> {
+    ExportFingerprintOptions {
+        include_fields: shared.include_fields.as_deref(),
+        exclude_fields: shared.exclude_fields.as_deref(),
+        no_attachments: shared.no_attachments,
+        include_json: shared.include_json,
+        include_changelog,
+        max_depth: hierarchy.then_some(shared.max_depth),
+        max_issues: hierarchy.then_some(shared.max_issues),
     }
 }
 
@@ -1332,7 +1504,12 @@ mod tests {
             }],
         };
         let mut manifest = Manifest::default();
-        let fingerprint = export_option_fingerprint(None, None, true);
+        let fingerprint = export_option_fingerprint(ExportFingerprintOptions {
+            no_attachments: true,
+            max_depth: Some(2),
+            max_issues: Some(200),
+            ..ExportFingerprintOptions::default()
+        });
         manifest.record_hierarchy(
             &tree,
             "A.hierarchy.md",
@@ -1367,6 +1544,168 @@ mod tests {
             "warm skip must not fetch full Issues or Changelogs, observed: {:?}",
             paths
         );
+
+        std::fs::remove_dir_all(output_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn warm_hierarchy_validation_omission_evicts_missing_descendant_without_full_fetch() {
+        let server = WarmHierarchyServer::start();
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let output_dir = std::env::temp_dir().join(format!(
+            "jarkdown-warm-hierarchy-evict-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for key in ["A", "B", "C"] {
+            std::fs::create_dir_all(output_dir.join(key)).unwrap();
+            std::fs::write(output_dir.join(key).join(format!("{}.md", key)), key).unwrap();
+        }
+        std::fs::write(output_dir.join("A.hierarchy.md"), "snapshot").unwrap();
+
+        let tree = jarkdown::IssueNode {
+            key: "A".to_string(),
+            summary: "Root A".to_string(),
+            issue_type: "Task".to_string(),
+            updated: "2026-01-01T00:00:00.000+0000".to_string(),
+            children_discovered: true,
+            truncated: false,
+            failures: Vec::new(),
+            children: vec![
+                jarkdown::IssueNode {
+                    key: "B".to_string(),
+                    summary: "Child B".to_string(),
+                    issue_type: "Task".to_string(),
+                    updated: "2026-01-01T00:00:00.000+0000".to_string(),
+                    children_discovered: true,
+                    truncated: false,
+                    failures: Vec::new(),
+                    children: Vec::new(),
+                },
+                jarkdown::IssueNode {
+                    key: "C".to_string(),
+                    summary: "Missing C".to_string(),
+                    issue_type: "Task".to_string(),
+                    updated: "2026-01-01T00:00:00.000+0000".to_string(),
+                    children_discovered: true,
+                    truncated: false,
+                    failures: Vec::new(),
+                    children: Vec::new(),
+                },
+            ],
+        };
+        let mut manifest = Manifest::default();
+        let fingerprint = export_option_fingerprint(ExportFingerprintOptions {
+            no_attachments: true,
+            max_depth: Some(2),
+            max_issues: Some(200),
+            ..ExportFingerprintOptions::default()
+        });
+        manifest.record_hierarchy(
+            &tree,
+            "A.hierarchy.md",
+            HierarchyLayout::Corpus,
+            fingerprint.as_deref(),
+        );
+        manifest.save(&output_dir).unwrap();
+
+        let mut shared = shared_args();
+        shared.hierarchy = true;
+        shared.incremental = true;
+        shared.no_attachments = true;
+        let result = run_hierarchy_export(&client, "A", &output_dir, &shared).await;
+
+        assert!(
+            result.success,
+            "warm hierarchy eviction should still succeed"
+        );
+        let paths = server.observed_paths();
+        assert!(
+            !paths.iter().any(|path| path.contains("/rest/api/3/issue/")),
+            "validation omission should not fall back to full Issue fetches: {:?}",
+            paths
+        );
+        let manifest = Manifest::load(&output_dir);
+        let c = manifest.get("C").unwrap();
+        assert_eq!(c.state, jarkdown::manifest::IssueCacheState::Evicted);
+        assert_eq!(
+            c.eviction_reason.as_deref(),
+            Some("not_returned_by_validation_search")
+        );
+        assert!(c.artifact_paths.iter().all(|path| !path.active));
+        assert!(output_dir.join("C").join("C.md").exists());
+        assert!(manifest
+            .edges
+            .iter()
+            .any(|edge| edge.child == "C" && !edge.active));
+
+        std::fs::remove_dir_all(output_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn hierarchy_backfills_missing_changelog_without_full_issue_fetch() {
+        let server = HierarchyChangelogBackfillServer::start();
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let output_dir = seeded_hierarchy_dir("jarkdown-hierarchy-changelog-backfill");
+        std::fs::write(output_dir.join("A.hierarchy.md"), "snapshot").unwrap();
+        std::fs::write(output_dir.join("A").join("A.changelog.md"), "existing").unwrap();
+        let mut manifest = Manifest::default();
+        let fingerprint = export_option_fingerprint(ExportFingerprintOptions {
+            no_attachments: true,
+            include_changelog: true,
+            max_depth: Some(2),
+            max_issues: Some(200),
+            ..ExportFingerprintOptions::default()
+        });
+        manifest.record_hierarchy(
+            &jarkdown::IssueNode {
+                key: "A".to_string(),
+                summary: "Root A".to_string(),
+                issue_type: "Task".to_string(),
+                updated: OLD_TS.to_string(),
+                children_discovered: true,
+                truncated: false,
+                failures: Vec::new(),
+                children: vec![jarkdown::IssueNode {
+                    key: "B".to_string(),
+                    summary: "Child B".to_string(),
+                    issue_type: "Task".to_string(),
+                    updated: OLD_TS.to_string(),
+                    children_discovered: true,
+                    truncated: false,
+                    failures: Vec::new(),
+                    children: Vec::new(),
+                }],
+            },
+            "A.hierarchy.md",
+            HierarchyLayout::Corpus,
+            fingerprint.as_deref(),
+        );
+        manifest.save(&output_dir).unwrap();
+
+        let mut shared = shared_args();
+        shared.hierarchy = true;
+        shared.incremental = true;
+        shared.no_attachments = true;
+        shared.include_changelog = true;
+        let result = run_hierarchy_export(&client, "A", &output_dir, &shared).await;
+
+        assert!(result.success, "changelog backfill should succeed");
+        let paths = server.observed_paths();
+        assert!(paths
+            .iter()
+            .any(|path| path.contains("/rest/api/3/issue/B/changelog")));
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path == "/rest/api/3/issue/B"
+                    || path.starts_with("/rest/api/3/issue/B?")),
+            "BackfillChangelogOnly must not fetch full Issue payload: {:?}",
+            paths
+        );
+        assert!(output_dir.join("B").join("B.changelog.md").exists());
 
         std::fs::remove_dir_all(output_dir).ok();
     }
@@ -1472,7 +1811,7 @@ mod tests {
         shared.hierarchy = true;
         shared.incremental = true;
         shared.no_attachments = true;
-        shared.max_depth = 1;
+        shared.max_depth = 2;
         let result = run_hierarchy_export(&client, "A", &output_dir, &shared).await;
 
         assert!(
@@ -1509,7 +1848,12 @@ mod tests {
         let server = ChangedHierarchyServer::start(ChangedHierarchyShape::SharedNested);
         let client = JiraApiClient::new_for_test(&server.base_url);
         let output_dir = seeded_nested_shared_dir("jarkdown-nested-shared");
-        let fingerprint = export_option_fingerprint(None, None, true);
+        let fingerprint = export_option_fingerprint(ExportFingerprintOptions {
+            no_attachments: true,
+            max_depth: Some(2),
+            max_issues: Some(200),
+            ..ExportFingerprintOptions::default()
+        });
         let mut manifest = Manifest::default();
         manifest.record_hierarchy(
             &jarkdown::IssueNode {
@@ -1614,7 +1958,12 @@ mod tests {
         let output_dir = seeded_hierarchy_dir("jarkdown-shared-plan");
         std::fs::write(output_dir.join("A.hierarchy.md"), "A snapshot").unwrap();
         std::fs::write(output_dir.join("B.hierarchy.md"), "B snapshot").unwrap();
-        let fingerprint = export_option_fingerprint(None, None, true);
+        let fingerprint = export_option_fingerprint(ExportFingerprintOptions {
+            no_attachments: true,
+            max_depth: Some(2),
+            max_issues: Some(200),
+            ..ExportFingerprintOptions::default()
+        });
         let mut manifest = Manifest::default();
         manifest.record_hierarchy(
             &jarkdown::IssueNode {
@@ -1845,7 +2194,12 @@ mod tests {
 
     fn seed_manifest_tree(output_dir: &std::path::Path, tree: jarkdown::IssueNode) {
         let mut manifest = Manifest::default();
-        let fingerprint = export_option_fingerprint(None, None, true);
+        let fingerprint = export_option_fingerprint(ExportFingerprintOptions {
+            no_attachments: true,
+            max_depth: Some(2),
+            max_issues: Some(200),
+            ..ExportFingerprintOptions::default()
+        });
         manifest.record_hierarchy(
             &tree,
             "A.hierarchy.md",
@@ -1856,6 +2210,11 @@ mod tests {
     }
 
     struct WarmHierarchyServer {
+        base_url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct HierarchyChangelogBackfillServer {
         base_url: String,
         requests: Arc<Mutex<Vec<String>>>,
     }
@@ -1917,6 +2276,26 @@ mod tests {
         }
     }
 
+    impl HierarchyChangelogBackfillServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let base_url = format!("http://{}", addr);
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let thread_requests = requests.clone();
+            thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    handle_hierarchy_changelog_backfill_request(stream, &thread_requests);
+                }
+            });
+            Self { base_url, requests }
+        }
+
+        fn observed_paths(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
     impl PlanValidationServer {
         fn start() -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -1957,6 +2336,49 @@ mod tests {
                     {"key":"B","fields":{"updated":"2026-01-01T00:00:00.000+0000","summary":"Child B","issuetype":{"name":"Task"},"status":{"name":"Open"}}}
                 ]}"#
                 .to_string(),
+            )
+        } else {
+            ("500 Internal Server Error", "{}".to_string())
+        };
+        let response = format!(
+            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status,
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).expect("write");
+    }
+
+    fn handle_hierarchy_changelog_backfill_request(
+        mut stream: TcpStream,
+        requests: &Arc<Mutex<Vec<String>>>,
+    ) {
+        let mut buf = [0u8; 8192];
+        let n = stream.read(&mut buf).expect("read");
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let path = req
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_string();
+        requests.lock().unwrap().push(path.clone());
+
+        let (status, body) = if path.starts_with("/rest/api/3/search/jql") {
+            (
+                "200 OK",
+                format!(
+                    r#"{{"issues":[
+                        {{"key":"A","fields":{{"updated":"{}","summary":"Root A","issuetype":{{"name":"Task"}},"status":{{"name":"Open"}}}}}},
+                        {{"key":"B","fields":{{"updated":"{}","summary":"Child B","issuetype":{{"name":"Task"}},"status":{{"name":"Open"}}}}}}
+                    ]}}"#,
+                    OLD_TS, OLD_TS
+                ),
+            )
+        } else if path.starts_with("/rest/api/3/issue/B/changelog") {
+            (
+                "200 OK",
+                r#"{"startAt":0,"maxResults":100,"total":0,"isLast":true,"values":[]}"#.to_string(),
             )
         } else {
             ("500 Internal Server Error", "{}".to_string())

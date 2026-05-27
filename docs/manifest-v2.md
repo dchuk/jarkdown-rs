@@ -26,9 +26,29 @@ Each Issue entry records cache facts for one Issue:
 - display metadata such as `summary` and `issue_type`
 - whether the Issue is currently active or evicted
 - artifact paths where this Issue is written
+- an option fingerprint for content-visible export settings
 
 An Evicted Issue stays in the manifest as an inactive tombstone. Its files are
 not deleted.
+
+## Option Fingerprint
+
+The option fingerprint is versioned. The current format starts with `v1:` and
+serializes sorted, normalized key/value pairs. Code that changes the format must
+use a new prefix so older cached entries safely invalidate.
+
+Content-visible options participate in the fingerprint:
+
+- `include_json`
+- `include_changelog`
+- `include_fields`
+- `exclude_fields`
+- `no_attachments`
+- hierarchy bounds when hierarchy output is involved: `max_depth` and
+  `max_issues`
+
+Options that affect only logging, concurrency, credentials, or destination
+selection do not belong in the fingerprint.
 
 ## Graph
 
