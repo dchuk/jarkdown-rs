@@ -31,6 +31,7 @@ pub struct PlanOptions<'a> {
     pub include_changelog: bool,
     pub include_json: bool,
     pub option_fingerprint: Option<&'a str>,
+    pub option_fingerprint_without_changelog: Option<&'a str>,
 }
 
 /// Decide what an incremental export should do for `issue`.
@@ -51,6 +52,7 @@ pub fn plan(
             include_changelog,
             include_json: false,
             option_fingerprint: None,
+            option_fingerprint_without_changelog: None,
         },
         issue_dir,
     )
@@ -68,8 +70,13 @@ pub fn plan_metadata(
     if manifest.is_stale(issue_key, updated) {
         return ExportPlan::Full;
     }
-    if entry.and_then(|entry| entry.option_fingerprint.as_deref()) != options.option_fingerprint {
-        return ExportPlan::Full;
+    let stored_fingerprint = entry.and_then(|entry| entry.option_fingerprint.as_deref());
+    if stored_fingerprint != options.option_fingerprint {
+        let changelog_only_delta = options.include_changelog
+            && stored_fingerprint == options.option_fingerprint_without_changelog;
+        if !changelog_only_delta {
+            return ExportPlan::Full;
+        }
     }
 
     let main_markdown = issue_dir.join(format!("{}.md", issue_key));

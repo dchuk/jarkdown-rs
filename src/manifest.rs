@@ -6,10 +6,13 @@
 //! and merge-on-write persistence.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use log::warn;
+use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{JarkdownError, Result};
@@ -196,6 +199,7 @@ impl Manifest {
         manifest.touched_edge_parents.clear();
         manifest.touched_root_snapshots.clear();
         manifest.normalize_issue_keys();
+        manifest.sanitize_artifact_paths();
         Ok(manifest)
     }
 
@@ -221,10 +225,8 @@ impl Manifest {
             std::fs::create_dir_all(parent)?;
         }
 
-        let tmp_path = temp_manifest_path(path);
         let content = serde_json::to_string_pretty(&to_write)?;
-        std::fs::write(&tmp_path, &content)?;
-        std::fs::rename(&tmp_path, path)?;
+        write_manifest_atomically(path, content.as_bytes())?;
         Ok(())
     }
 
@@ -232,7 +234,21 @@ impl Manifest {
     /// manifest, is inactive, or its `updated` timestamp has changed.
     pub fn is_stale(&self, issue_key: &str, updated: &str) -> bool {
         match self.issues.get(&normalize_issue_key(issue_key)) {
-            Some(entry) => entry.state != IssueCacheState::Active || entry.updated != updated,
+            Some(entry) if entry.state != IssueCacheState::Active => true,
+            Some(entry) => match compare_jira_updated(&entry.updated, updated) {
+                UpdatedComparison::IncomingNewer => true,
+                UpdatedComparison::Equal => false,
+                UpdatedComparison::IncomingOlder => {
+                    warn!(
+                        "Validation timestamp for {} is older than cached manifest timestamp (cached={}, validation={}); treating as unchanged.",
+                        normalize_issue_key(issue_key),
+                        entry.updated,
+                        updated
+                    );
+                    false
+                }
+                UpdatedComparison::Unparseable => entry.updated != updated,
+            },
             None => true,
         }
     }
@@ -240,10 +256,11 @@ impl Manifest {
     /// Record minimal export metadata for compatibility with existing tests.
     pub fn record(&mut self, issue_key: &str, updated: &str) {
         let key = normalize_issue_key(issue_key);
+        let stored_updated = self.stored_updated_for(&key, updated);
         self.issues.insert(
             key.clone(),
             ManifestEntry {
-                updated: updated.to_string(),
+                updated: stored_updated,
                 exported_at: Utc::now(),
                 summary: None,
                 issue_type: None,
@@ -318,6 +335,14 @@ impl Manifest {
         option_fingerprint: Option<&str>,
     ) {
         let key = normalize_issue_key(issue_key);
+        let stored_updated = self.stored_updated_for(&key, updated);
+        let artifact_path = normalize_artifact_path(&artifact_path.into());
+        let mut existing_artifacts = self
+            .issues
+            .get(&key)
+            .map(|entry| entry.artifact_paths.clone())
+            .unwrap_or_default();
+        upsert_artifact_path(&mut existing_artifacts, artifact_path, true);
         let (requested_roots, hierarchy_roots) = self
             .issues
             .get(&key)
@@ -326,17 +351,14 @@ impl Manifest {
         self.issues.insert(
             key.clone(),
             ManifestEntry {
-                updated: updated.to_string(),
+                updated: stored_updated,
                 exported_at: Utc::now(),
                 summary: summary.map(str::to_string),
                 issue_type: issue_type.map(str::to_string),
                 status: status.map(str::to_string),
                 state: IssueCacheState::Active,
                 eviction_reason: None,
-                artifact_paths: vec![ArtifactPath {
-                    path: artifact_path.into(),
-                    active: true,
-                }],
+                artifact_paths: existing_artifacts,
                 option_fingerprint: option_fingerprint.map(str::to_string),
                 requested_roots,
                 hierarchy_roots,
@@ -367,7 +389,14 @@ impl Manifest {
         for path in &mut entry.artifact_paths {
             path.active = false;
         }
+        for edge in &mut self.edges {
+            if edge.active && (edge.parent == key || edge.child == key) {
+                edge.active = false;
+                self.touched_edge_parents.insert(edge.parent.clone());
+            }
+        }
         self.touched_issues.insert(key);
+        self.touched_graph = true;
     }
 
     pub fn record_hierarchy(
@@ -459,13 +488,14 @@ impl Manifest {
         option_fingerprint: Option<&str>,
     ) {
         let key = normalize_issue_key(issue_key);
+        let artifact_path = normalize_artifact_path(&artifact_path.into());
         self.record_hierarchy_metadata_inner(
             &key,
             updated,
             summary,
             issue_type,
             status,
-            &normalize_artifact_path(&artifact_path.into()),
+            &artifact_path,
             option_fingerprint,
         );
     }
@@ -477,7 +507,7 @@ impl Manifest {
                     .artifact_paths
                     .iter()
                     .filter(|path| path.active)
-                    .map(|path| path.path.clone())
+                    .filter_map(|path| sanitize_artifact_path(&path.path))
                     .collect()
             })
             .unwrap_or_default()
@@ -503,6 +533,29 @@ impl Manifest {
     pub fn max_cached_descendant_depth(&self, issue_key: &str) -> u32 {
         let issue_key = normalize_issue_key(issue_key);
         self.max_cached_descendant_depth_inner(&issue_key, &mut HashSet::new())
+    }
+
+    pub fn remaining_depth_for_refresh(&self, issue_key: &str, max_depth: u32) -> u32 {
+        let issue_key = normalize_issue_key(issue_key);
+        if self
+            .get(&issue_key)
+            .is_some_and(|entry| entry.requested_roots.contains(&issue_key))
+        {
+            return max_depth;
+        }
+        let roots = self
+            .get(&issue_key)
+            .map(|entry| entry.hierarchy_roots.clone())
+            .unwrap_or_default();
+        let mut best = 0;
+        for root in roots {
+            for depth in self.active_depths_to(&root, &issue_key, &mut HashSet::new()) {
+                if depth <= max_depth {
+                    best = best.max(max_depth - depth);
+                }
+            }
+        }
+        best
     }
 
     pub fn is_descendant_of(&self, ancestor: &str, candidate: &str) -> bool {
@@ -630,6 +683,7 @@ impl Manifest {
         option_fingerprint: Option<&str>,
     ) {
         let key = normalize_issue_key(key);
+        let stored_updated = self.stored_updated_for(&key, updated);
         let mut existing_artifacts = self
             .issues
             .get(&key)
@@ -644,7 +698,7 @@ impl Manifest {
         self.issues.insert(
             key.clone(),
             ManifestEntry {
-                updated: updated.to_string(),
+                updated: stored_updated,
                 exported_at: Utc::now(),
                 summary: summary.map(str::to_string),
                 issue_type: issue_type.map(str::to_string),
@@ -804,6 +858,34 @@ impl Manifest {
             .unwrap_or(0)
     }
 
+    fn active_depths_to(
+        &self,
+        current: &str,
+        target: &str,
+        visited: &mut HashSet<String>,
+    ) -> Vec<u32> {
+        let current = normalize_issue_key(current);
+        let target = normalize_issue_key(target);
+        if !visited.insert(current.clone()) {
+            return Vec::new();
+        }
+        let mut depths = Vec::new();
+        if current == target {
+            depths.push(0);
+        }
+        for edge in self
+            .edges
+            .iter()
+            .filter(|edge| edge.active && edge.parent == current && self.is_active(&edge.child))
+        {
+            let mut child_visited = visited.clone();
+            for depth in self.active_depths_to(&edge.child, &target, &mut child_visited) {
+                depths.push(depth + 1);
+            }
+        }
+        depths
+    }
+
     fn is_descendant_of_inner(
         &self,
         ancestor: &str,
@@ -834,6 +916,61 @@ impl Manifest {
             .into_iter()
             .map(|(key, entry)| (normalize_issue_key(&key), entry))
             .collect();
+        for edge in &mut self.edges {
+            edge.parent = normalize_issue_key(&edge.parent);
+            edge.child = normalize_issue_key(&edge.child);
+        }
+        let snapshots = std::mem::take(&mut self.root_snapshots);
+        self.root_snapshots = snapshots
+            .into_iter()
+            .map(|(key, mut snapshot)| {
+                let normalized = normalize_issue_key(&key);
+                snapshot.root_key = normalize_issue_key(&snapshot.root_key);
+                for failure in &mut snapshot.failures {
+                    failure.issue_key = normalize_issue_key(&failure.issue_key);
+                }
+                (normalized, snapshot)
+            })
+            .collect();
+        for entry in self.issues.values_mut() {
+            entry.requested_roots = normalized_unique_keys(&entry.requested_roots);
+            entry.hierarchy_roots = normalized_unique_keys(&entry.hierarchy_roots);
+        }
+    }
+
+    fn sanitize_artifact_paths(&mut self) {
+        for (issue_key, entry) in &mut self.issues {
+            entry.artifact_paths.retain_mut(|artifact| {
+                if let Some(path) = sanitize_artifact_path(&artifact.path) {
+                    artifact.path = path;
+                    true
+                } else {
+                    warn!(
+                        "Dropping unsafe manifest artifact path for {}: {}",
+                        issue_key, artifact.path
+                    );
+                    false
+                }
+            });
+        }
+    }
+
+    fn stored_updated_for(&self, issue_key: &str, incoming: &str) -> String {
+        let Some(existing) = self.get(issue_key) else {
+            return incoming.to_string();
+        };
+        match compare_jira_updated(&existing.updated, incoming) {
+            UpdatedComparison::IncomingOlder => {
+                warn!(
+                    "Refusing to regress manifest timestamp for {} from {} to {}.",
+                    normalize_issue_key(issue_key),
+                    existing.updated,
+                    incoming
+                );
+                existing.updated.clone()
+            }
+            _ => incoming.to_string(),
+        }
     }
 }
 
@@ -854,20 +991,90 @@ pub fn relative_artifact_path(output_root: &Path, artifact_path: &Path) -> Strin
         .to_string()
 }
 
-pub fn export_option_fingerprint(
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExportFingerprintOptions<'a> {
+    pub include_fields: Option<&'a str>,
+    pub exclude_fields: Option<&'a str>,
+    pub no_attachments: bool,
+    pub include_json: bool,
+    pub include_changelog: bool,
+    pub max_depth: Option<u32>,
+    pub max_issues: Option<u32>,
+}
+
+pub fn export_option_fingerprint(options: ExportFingerprintOptions<'_>) -> Option<String> {
+    if options.include_fields.is_none()
+        && options.exclude_fields.is_none()
+        && !options.no_attachments
+        && !options.include_json
+        && !options.include_changelog
+        && options.max_depth.is_none()
+        && options.max_issues.is_none()
+    {
+        return None;
+    }
+    Some(format!(
+        "v1:exclude_fields={};include_changelog={};include_fields={};include_json={};max_depth={};max_issues={};no_attachments={}",
+        canonical_field_list(options.exclude_fields),
+        options.include_changelog,
+        canonical_field_list(options.include_fields),
+        options.include_json,
+        options
+            .max_depth
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        options
+            .max_issues
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        options.no_attachments
+    ))
+}
+
+pub fn legacy_export_option_fingerprint(
     include_fields: Option<&str>,
     exclude_fields: Option<&str>,
     no_attachments: bool,
 ) -> Option<String> {
-    if include_fields.is_none() && exclude_fields.is_none() && !no_attachments {
+    export_option_fingerprint(ExportFingerprintOptions {
+        include_fields,
+        exclude_fields,
+        no_attachments,
+        ..ExportFingerprintOptions::default()
+    })
+}
+
+pub fn sanitize_artifact_path(path: &str) -> Option<String> {
+    let normalized = path.replace('\\', "/");
+    if normalized.is_empty() || normalized.starts_with('/') {
         return None;
     }
-    Some(format!(
-        "include_fields={};exclude_fields={};no_attachments={}",
-        canonical_field_list(include_fields),
-        canonical_field_list(exclude_fields),
-        no_attachments
-    ))
+    let first_segment = normalized.split('/').next().unwrap_or_default();
+    if first_segment.len() == 2
+        && first_segment.ends_with(':')
+        && first_segment.as_bytes()[0].is_ascii_alphabetic()
+    {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    for component in Path::new(&normalized).components() {
+        match component {
+            Component::Normal(part) => {
+                let part = part.to_string_lossy();
+                if part.is_empty() || part == "." || part == ".." {
+                    return None;
+                }
+                parts.push(part.to_string());
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("/"))
 }
 
 fn push_unique(values: &mut Vec<String>, value: String) {
@@ -899,12 +1106,10 @@ fn hierarchy_artifact_path(
 }
 
 fn normalize_artifact_path(path: &str) -> String {
-    path.replace('\\', "/")
-        .trim_matches('/')
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("/")
+    sanitize_artifact_path(path).unwrap_or_else(|| {
+        warn!("Rejected unsafe artifact path while normalizing: {}", path);
+        "UNSAFE_ARTIFACT_PATH".to_string()
+    })
 }
 
 fn hierarchy_truncated(node: &IssueNode) -> bool {
@@ -936,6 +1141,46 @@ fn canonical_field_list(fields: Option<&str>) -> String {
         .collect();
     fields.sort();
     fields.join(",")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdatedComparison {
+    IncomingNewer,
+    Equal,
+    IncomingOlder,
+    Unparseable,
+}
+
+fn compare_jira_updated(cached: &str, incoming: &str) -> UpdatedComparison {
+    let Some(cached) = parse_jira_updated(cached) else {
+        return UpdatedComparison::Unparseable;
+    };
+    let Some(incoming) = parse_jira_updated(incoming) else {
+        return UpdatedComparison::Unparseable;
+    };
+    match incoming.cmp(&cached) {
+        std::cmp::Ordering::Greater => UpdatedComparison::IncomingNewer,
+        std::cmp::Ordering::Equal => UpdatedComparison::Equal,
+        std::cmp::Ordering::Less => UpdatedComparison::IncomingOlder,
+    }
+}
+
+fn parse_jira_updated(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .or_else(|_| DateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f%z"))
+        .ok()
+        .map(|datetime| datetime.with_timezone(&Utc))
+}
+
+fn normalized_unique_keys(keys: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in keys {
+        let key = normalize_issue_key(key);
+        if !key.is_empty() && !out.contains(&key) {
+            out.push(key);
+        }
+    }
+    out
 }
 
 fn migrate_v1(value: serde_json::Value) -> Result<Manifest> {
@@ -970,17 +1215,42 @@ fn migrate_v1(value: serde_json::Value) -> Result<Manifest> {
     Ok(manifest)
 }
 
-fn temp_manifest_path(path: &Path) -> PathBuf {
-    let mut extension = path
-        .extension()
-        .map(|ext| ext.to_string_lossy().to_string())
-        .unwrap_or_default();
-    if extension.is_empty() {
-        extension = "tmp".to_string();
-    } else {
-        extension.push_str(".tmp");
+fn write_manifest_atomically(path: &Path, content: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| MANIFEST_FILENAME.to_string());
+    let mut last_error = None;
+    for _ in 0..16 {
+        let random: String = rand::thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(12)
+            .map(char::from)
+            .collect();
+        let tmp_path = parent.join(format!(".{}.{}.tmp", file_name, random));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+        {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(content).and_then(|_| file.sync_all()) {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(e.into());
+                }
+                std::fs::rename(&tmp_path, path)?;
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_error = Some(e);
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
-    path.with_extension(extension)
+    Err(last_error
+        .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::AlreadyExists, "temp path"))
+        .into())
 }
 
 #[cfg(test)]
@@ -1091,6 +1361,133 @@ mod tests {
     }
 
     #[test]
+    fn stale_comparison_parses_timestamps_with_string_fallback() {
+        let mut manifest = Manifest::default();
+        manifest.record("PROJ-1", "2026-01-01T00:00:00.000+0000");
+
+        assert!(!manifest.is_stale("PROJ-1", "2026-01-01T00:00:00Z"));
+        assert!(manifest.is_stale("PROJ-1", "2026-01-01T00:00:01Z"));
+        assert!(!manifest.is_stale("PROJ-1", "2025-12-31T23:59:59Z"));
+        assert!(manifest.is_stale("PROJ-1", "not-a-timestamp"));
+
+        manifest.record_metadata(
+            "PROJ-1",
+            "2025-12-31T23:59:59Z",
+            Some("Older"),
+            Some("Task"),
+            Some("Open"),
+            "PROJ-1",
+        );
+        assert_eq!(
+            manifest.get("PROJ-1").unwrap().updated,
+            "2026-01-01T00:00:00.000+0000"
+        );
+    }
+
+    #[test]
+    fn option_fingerprint_is_versioned_and_includes_content_visible_inputs() {
+        let base = export_option_fingerprint(ExportFingerprintOptions {
+            no_attachments: true,
+            ..ExportFingerprintOptions::default()
+        })
+        .unwrap();
+
+        assert!(base.starts_with("v1:"));
+        assert_ne!(
+            base,
+            export_option_fingerprint(ExportFingerprintOptions {
+                no_attachments: true,
+                include_json: true,
+                ..ExportFingerprintOptions::default()
+            })
+            .unwrap()
+        );
+        assert_ne!(
+            base,
+            export_option_fingerprint(ExportFingerprintOptions {
+                no_attachments: true,
+                include_changelog: true,
+                ..ExportFingerprintOptions::default()
+            })
+            .unwrap()
+        );
+        assert_ne!(
+            base,
+            export_option_fingerprint(ExportFingerprintOptions {
+                no_attachments: true,
+                max_depth: Some(3),
+                ..ExportFingerprintOptions::default()
+            })
+            .unwrap()
+        );
+        assert_ne!(
+            base,
+            export_option_fingerprint(ExportFingerprintOptions {
+                no_attachments: true,
+                max_issues: Some(10),
+                ..ExportFingerprintOptions::default()
+            })
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn unsafe_artifact_paths_are_dropped_on_load() {
+        let dir = temp_dir("unsafe-path");
+        let path = default_manifest_path(&dir);
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 2,
+                "issues": {
+                    "PROJ-1": {
+                        "updated": "2026-01-01T00:00:00.000+0000",
+                        "exported_at": "2026-01-02T00:00:00Z",
+                        "state": "active",
+                        "artifact_paths": [
+                            {"path": "../escape", "active": true},
+                            {"path": "/absolute", "active": true},
+                            {"path": "C:\\escape", "active": true},
+                            {"path": "PROJ-1", "active": true}
+                        ]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let manifest = Manifest::load_from_path(&path).unwrap();
+        assert_eq!(
+            manifest.active_artifact_paths("PROJ-1"),
+            vec!["PROJ-1".to_string()]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn randomized_manifest_save_does_not_follow_legacy_temp_symlink() {
+        let dir = temp_dir("temp-symlink");
+        let path = dir.join("state.json");
+        let legacy_tmp = dir.join("state.json.tmp");
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "do not overwrite").unwrap();
+        std::os::unix::fs::symlink(&target, &legacy_tmp).unwrap();
+
+        let mut manifest = Manifest::default();
+        manifest.record("PROJ-1", "2026-01-01T00:00:00.000+0000");
+        manifest.save_to_path(&path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "do not overwrite"
+        );
+        assert!(path.exists());
+        assert!(legacy_tmp.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn completed_child_discovery_removes_only_relevant_edge_and_orphans_child() {
         let mut manifest = Manifest::default();
         manifest.record_hierarchy(
@@ -1148,6 +1545,48 @@ mod tests {
             .iter()
             .any(|edge| edge.parent == "A" && edge.child == "C" && edge.active));
         assert!(manifest.root_snapshots["A"].truncated);
+    }
+
+    #[test]
+    fn remaining_depth_for_refresh_uses_requested_root_path_depths() {
+        let mut manifest = Manifest::default();
+        manifest.record_hierarchy(
+            &hierarchy_node(
+                "A",
+                vec![hierarchy_node(
+                    "B",
+                    vec![hierarchy_node("C", vec![hierarchy_node("D", vec![])])],
+                )],
+            ),
+            "A.hierarchy.md",
+            HierarchyLayout::Corpus,
+            None,
+        );
+
+        assert_eq!(manifest.remaining_depth_for_refresh("C", 3), 1);
+        assert_eq!(manifest.remaining_depth_for_refresh("A", 3), 3);
+    }
+
+    #[test]
+    fn remaining_depth_for_refresh_uses_max_across_active_paths() {
+        let mut manifest = Manifest::default();
+        manifest.record_hierarchy(
+            &hierarchy_node(
+                "A",
+                vec![hierarchy_node("X", vec![hierarchy_node("C", vec![])])],
+            ),
+            "A.hierarchy.md",
+            HierarchyLayout::Corpus,
+            None,
+        );
+        manifest.record_hierarchy(
+            &hierarchy_node("B", vec![hierarchy_node("C", vec![])]),
+            "B.hierarchy.md",
+            HierarchyLayout::Corpus,
+            None,
+        );
+
+        assert_eq!(manifest.remaining_depth_for_refresh("C", 3), 2);
     }
 
     #[test]
