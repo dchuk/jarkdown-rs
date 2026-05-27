@@ -14,13 +14,13 @@ This crate provides both a **CLI tool** (`jarkdown-rs`) and an **importable libr
 ### Homebrew (macOS)
 
 ```bash
-brew install dchuk/tap/jarkdown-rs
+brew install dchuk/tap/jarkdown
 ```
 
 ### Shell installer (macOS / Linux)
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dchuk/jarkdown-rs/releases/latest/download/jarkdown-rs-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dchuk/jarkdown-rs/releases/latest/download/jarkdown-installer.sh | sh
 ```
 
 ### Prebuilt binaries
@@ -29,11 +29,11 @@ Download the latest binary for your platform from the [releases page](https://gi
 
 | Platform | Archive |
 |----------|---------|
-| macOS (Apple Silicon) | `jarkdown-rs-aarch64-apple-darwin.tar.xz` |
-| macOS (Intel) | `jarkdown-rs-x86_64-apple-darwin.tar.xz` |
-| Linux (x86_64) | `jarkdown-rs-x86_64-unknown-linux-gnu.tar.xz` |
-| Linux (ARM64) | `jarkdown-rs-aarch64-unknown-linux-gnu.tar.xz` |
-| Windows (x86_64) | `jarkdown-rs-x86_64-pc-windows-msvc.zip` |
+| macOS (Apple Silicon) | `jarkdown-aarch64-apple-darwin.tar.xz` |
+| macOS (Intel) | `jarkdown-x86_64-apple-darwin.tar.xz` |
+| Linux (x86_64) | `jarkdown-x86_64-unknown-linux-gnu.tar.xz` |
+| Linux (ARM64) | `jarkdown-aarch64-unknown-linux-gnu.tar.xz` |
+| Windows (x86_64) | `jarkdown-x86_64-pc-windows-msvc.zip` |
 
 ### From crates.io
 
@@ -117,10 +117,12 @@ jarkdown-rs export PROJ-123 --attachment-concurrency 0  # serial downloads
 # Incremental export (skip unchanged issues)
 jarkdown-rs bulk PROJ-1 PROJ-2 PROJ-3 --incremental
 jarkdown-rs bulk PROJ-1 PROJ-2 PROJ-3 --incremental --force  # override skip
+jarkdown-rs bulk PROJ-1 PROJ-2 PROJ-3 --incremental --manifest ./cache/jarkdown.json
 
 # Hierarchical export (epics, JPD ideas, and children — works with any command)
 jarkdown-rs export EPIC-123 --hierarchy
 jarkdown-rs export EPIC-123 --hierarchy --max-depth 3 --max-issues 500
+jarkdown-rs export EPIC-123 --hierarchy --hierarchy-layout nested
 jarkdown-rs bulk EPIC-1 EPIC-2 --hierarchy
 jarkdown-rs query 'type = Epic AND project = FOO' --hierarchy
 
@@ -146,6 +148,7 @@ jarkdown-rs export PROJ-123 --verbose
 | Flag | Applies To | Default |
 |------|-----------|---------|
 | `--output` | all | current directory |
+| `--manifest` | all | `<output>/.jarkdown-manifest.json` |
 | `--verbose` | all | off |
 | `--refresh-fields` | all | off |
 | `--include-fields` | all | none (all fields) |
@@ -160,6 +163,7 @@ jarkdown-rs export PROJ-123 --verbose
 | `--incremental` | all | off |
 | `--force` | all | off |
 | `--hierarchy` | all | off |
+| `--hierarchy-layout` | all (with `--hierarchy`) | `corpus` for `--incremental --hierarchy`; legacy `nested` otherwise |
 | `--max-depth` | all (with `--hierarchy`) | 2 |
 | `--max-issues` | all (with `--hierarchy`) | 200 |
 | `--include-changelog` | all | off (writes `{KEY}.changelog.md`; see [ADR-0001](docs/adr/0001-changelog-export.md)) |
@@ -218,6 +222,48 @@ output/
     ├── PROJ-3.md
     └── spec.pdf
 ```
+
+### Incremental Manifest
+
+`--incremental` writes a manifest v2 cache index at
+`<output>/.jarkdown-manifest.json` by default. Use `--manifest <path>` when
+the cache state should live somewhere else. Artifact paths inside the manifest
+remain relative to the export output root, not to the manifest file.
+
+Manifest v2 tracks validated Jira `updated` timestamps, content-visible option
+fingerprints, evicted Issue tombstones, hierarchy graph edges, requested roots,
+and every active artifact path used by nested hierarchy exports. This lets
+unchanged exports skip full Issue fetches while still repairing missing JSON or
+changelog sidecars. See [`docs/manifest-v2.md`](docs/manifest-v2.md) for the
+cache format and safety rules.
+
+### Hierarchy Layouts
+
+Incremental hierarchy export defaults to `corpus`, which writes one canonical
+directory per Issue plus a `{ROOT}.hierarchy.md` snapshot:
+
+```
+output/
+├── EPIC-123/
+│   └── EPIC-123.md
+├── STORY-1/
+│   └── STORY-1.md
+└── EPIC-123.hierarchy.md
+```
+
+Use `--hierarchy-layout nested` when you want the older browsable tree layout:
+
+```
+output/
+├── index.md
+└── EPIC-123/
+    ├── EPIC-123.md
+    └── STORY-1/
+        └── STORY-1.md
+```
+
+Nested incremental exports record every active path for shared Issues, so a
+changed shared Issue can be refreshed everywhere it appears.
 
 ## Markdown Format
 
@@ -439,6 +485,8 @@ PRs welcome! Please ensure `cargo clippy` and `cargo test` pass before submittin
   pipeline.
 - [`CONTEXT.md`](CONTEXT.md) — domain glossary (Issue, Changelog, Comment,
   Worklog) and the terms code/docs should standardize on.
+- [`CHANGELOG.md`](CHANGELOG.md) — release notes for users installing from
+  crates.io, Homebrew, shell installers, or GitHub Releases.
 - [`docs/adr/`](docs/adr/) — Architecture Decision Records covering
   non-obvious design choices (changelog export shape, typed `Issue` model).
 
