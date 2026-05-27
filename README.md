@@ -8,6 +8,8 @@ A fast, full-featured Rust CLI and library for exporting Jira Cloud issues to Ma
 This crate provides both a **CLI tool** (`jarkdown-rs`) and an **importable library** for use in other Rust projects.
 
 > **Note:** The CLI binary is named `jarkdown-rs` to avoid conflicts with the Python [jarkdown](https://github.com/dchuk/jarkdown) package.
+> Homebrew and crates.io package names are `jarkdown`, but the installed
+> executable is still `jarkdown-rs`.
 
 ## Installation
 
@@ -53,7 +55,7 @@ cargo install --path .
 
 ```toml
 [dependencies]
-jarkdown = { git = "https://github.com/dchuk/jarkdown-rs" }
+jarkdown = "1.7"
 ```
 
 ## Setup
@@ -236,6 +238,17 @@ and every active artifact path used by nested hierarchy exports. This lets
 unchanged exports skip full Issue fetches while still repairing missing JSON or
 changelog sidecars. See [`docs/manifest-v2.md`](docs/manifest-v2.md) for the
 cache format and safety rules.
+
+Incremental validation is conservative:
+
+- successful Jira validation omissions mark active cached Issues as evicted
+  without deleting their files;
+- failed validation requests do not evict anything;
+- parsed Jira `updated` timestamps drive freshness, with string comparison used
+  only when parsing fails;
+- changing content-visible options such as `--include-json`,
+  `--include-changelog`, field filters, `--no-attachments`, `--max-depth`, or
+  `--max-issues` invalidates stale cached artifacts.
 
 ### Hierarchy Layouts
 
@@ -441,7 +454,11 @@ jarkdown-rs export IDEA-42 --hierarchy --max-depth 3
 jarkdown-rs export IDEA-42
 ```
 
-In `--hierarchy` mode, jarkdown-rs follows the full chain: Idea → Epics → Stories/Tasks → Subtasks, producing a nested directory tree with an index.
+In `--hierarchy` mode, jarkdown-rs follows the full chain: Idea → Epics →
+Stories/Tasks → Subtasks. Non-incremental hierarchy exports default to the
+legacy nested tree with an `index.md`; incremental hierarchy exports default to
+the corpus layout for better shared-cache behavior. Use `--hierarchy-layout
+nested` or `--hierarchy-layout corpus` to choose explicitly.
 
 ## Requirements
 
@@ -480,15 +497,16 @@ PRs welcome! Please ensure `cargo clippy` and `cargo test` pass before submittin
 
 - [`docs/architecture.md`](docs/architecture.md) — layered architecture with
   MermaidJS diagrams for the overall system, single-issue export flow, bulk
-  concurrency, hierarchy traversal, the incremental-freshness state machine,
-  the pure render pipeline, the typed/raw `Issue` duality, and the attachment
+  concurrency, hierarchy traversal, child-aware incremental validation, the
+  pure render pipeline, the typed/raw `Issue` duality, and the attachment
   pipeline.
 - [`CONTEXT.md`](CONTEXT.md) — domain glossary (Issue, Changelog, Comment,
   Worklog) and the terms code/docs should standardize on.
 - [`CHANGELOG.md`](CHANGELOG.md) — release notes for users installing from
   crates.io, Homebrew, shell installers, or GitHub Releases.
 - [`docs/adr/`](docs/adr/) — Architecture Decision Records covering
-  non-obvious design choices (changelog export shape, typed `Issue` model).
+  non-obvious design choices including changelog export shape, typed `Issue`
+  parsing, validation metadata, and child-aware incremental hierarchy caching.
 
 ## License
 

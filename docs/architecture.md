@@ -3,67 +3,75 @@
 This document describes how jarkdown-rs is layered and how data flows through
 the codebase. It complements:
 
-- `CONTEXT.md` — domain glossary (Issue, Changelog, Comment, Worklog).
-- `docs/adr/0001-changelog-export.md` — why the changelog is a sibling artifact
-  with one-time backfill semantics.
+- `CONTEXT.md` — domain glossary.
+- `docs/manifest-v2.md` — manifest v2 cache format and diagnostics.
+- `docs/adr/0001-changelog-export.md` — why changelog artifacts are siblings
+  with one-time incremental backfill semantics.
 - `docs/adr/0002-typed-issue-model-retains-raw-payload.md` — why `Issue` keeps
-  both the typed spine and the raw `Value`.
+  both typed fields and the raw Jira payload.
+- `docs/adr/0003-incremental-validation-uses-manifest-metadata.md` — why warm
+  incremental paths use validation metadata instead of full Issue fetches.
+- `docs/adr/0004-child-aware-incremental-manifest.md` — why hierarchy cache
+  state is graph-backed.
 
 All diagrams are MermaidJS and render natively on GitHub and most modern
 Markdown viewers.
 
-## Overall architecture
+## Overall Architecture
 
-Five layers, each depending only on the ones below it. The CLI is a thin shell
-over the library; everything reusable lives behind `src/lib.rs`.
+The CLI is a thin shell over the reusable library surface. Network transport,
+domain parsing, rendering, cache planning, and filesystem writes stay separated
+so tests can exercise behavior with local scripted HTTP servers and fake
+exporters.
 
 ```mermaid
 flowchart TB
     subgraph entry[Entry surface]
-        CLI["CLI bin<br/><code>jarkdown-rs</code><br/>(main.rs · cli.rs)"]
-        LIB["Library API<br/>(lib.rs:<br/><code>export_issue</code> · <code>ExportOptions</code>)"]
+        CLI["CLI bin<br/><code>jarkdown-rs</code><br/>(main.rs, cli.rs)"]
+        LIB["Library API<br/>(lib.rs:<br/><code>export_issue</code>, <code>ExportOptions</code>)"]
     end
 
     subgraph orch[Orchestration]
-        EXPORT["<code>export::perform_export_with_options</code><br/>single-issue workflow"]
-        BULK["<code>bulk::BulkExporter</code><br/>semaphore-bounded fan-out"]
-        HIER["<code>hierarchy::HierarchyExporter</code><br/>recursive tree traversal"]
-        EXSEAM["<code>exporter::IssueExporter</code><br/>trait seam"]
+        EXPORT["<code>export::perform_export_with_options</code><br/>single Issue workflow"]
+        BULK["<code>bulk::BulkExporter</code><br/>concurrent flat export"]
+        HIER["<code>hierarchy::HierarchyExporter</code><br/>recursive traversal"]
+        PLANNER["main.rs hierarchy warm planner<br/>validation, skip, refresh"]
+        EXSEAM["<code>exporter::IssueExporter</code><br/>test seam"]
     end
 
-    subgraph domain[HTTP &amp; domain]
-        CLIENT["<code>jira_client::JiraApiClient</code><br/>REST · auth · pagination"]
-        ISSUE["<code>issue::Issue</code><br/>typed + raw payload"]
+    subgraph domain[HTTP and domain]
+        CLIENT["<code>jira_client::JiraApiClient</code><br/>REST, auth, pagination"]
+        ISSUE["<code>issue::Issue</code><br/>typed spine + raw payload"]
         CL["<code>changelog::*</code><br/>render + write"]
         RETRY["<code>retry::retry_with_backoff</code>"]
     end
 
-    subgraph render[Rendering · pure]
-        COMPOSE["<code>markdown::compose(&amp;RenderContext)</code>"]
-        SECTIONS["<code>markdown::sections</code><br/>frontmatter · description · ..."]
-        ADF["<code>markdown::adf</code><br/>ADF → MD"]
-        HTML["<code>markdown::html</code><br/>HTML → MD"]
-        ATTIDX["<code>markdown::attachments::AttachmentIndex</code>"]
-        CFR["<code>custom_field::CustomFieldRenderer</code>"]
-    end
-
-    subgraph state[Persistence &amp; caches]
-        MAN["<code>manifest::Manifest</code><br/>.jarkdown-manifest.json"]
-        FRESH["<code>freshness::plan</code><br/>ADR-0001 decision"]
-        FCACHE["<code>field_cache::FieldMetadataCache</code><br/>XDG · 24h TTL"]
+    subgraph state[Persistence and planning]
+        MAN["<code>manifest::Manifest</code><br/>manifest v2 graph cache"]
+        FRESH["<code>freshness::plan_metadata</code><br/>freshness decision"]
+        FCACHE["<code>field_cache::FieldMetadataCache</code><br/>XDG, 24h TTL"]
         CFG["<code>config::ConfigManager</code><br/>.jarkdown.toml"]
         ATT["<code>attachment::AttachmentHandler</code><br/>download + dedupe"]
     end
 
-    JIRA[(Jira Cloud<br/>REST API v3)]
-    FS[(Filesystem<br/><code>{KEY}/{KEY}.md</code>)]
+    subgraph render[Pure rendering]
+        COMPOSE["<code>markdown::compose(&RenderContext)</code>"]
+        SECTIONS["<code>markdown::sections</code>"]
+        ADF["<code>markdown::adf</code>"]
+        HTML["<code>markdown::html</code>"]
+        ATTIDX["<code>markdown::attachments::AttachmentIndex</code>"]
+        CFR["<code>custom_field::CustomFieldRenderer</code>"]
+    end
+
+    JIRA[(Jira Cloud REST API v3)]
+    FS[(Filesystem artifacts)]
 
     CLI --> LIB
     CLI --> EXPORT
     CLI --> BULK
-    CLI --> HIER
+    CLI --> PLANNER
+    PLANNER --> HIER
     LIB --> EXPORT
-
     BULK --> EXPORT
     BULK --> FRESH
     BULK --> MAN
@@ -76,11 +84,13 @@ flowchart TB
     EXPORT --> CFG
     EXPORT --> FCACHE
     EXPORT --> COMPOSE
-    EXPORT --> FRESH
+    PLANNER --> CLIENT
+    PLANNER --> FRESH
+    PLANNER --> MAN
 
-    CL --> CLIENT
     CLIENT --> RETRY
     CLIENT --> ISSUE
+    CL --> CLIENT
     ATT --> CLIENT
 
     COMPOSE --> SECTIONS
@@ -91,329 +101,332 @@ flowchart TB
 
     CLIENT -->|HTTPS| JIRA
     EXPORT -->|writes| FS
-    CL -->|writes| FS
-    ATT -->|writes| FS
+    HIER -->|writes indexes| FS
+    CL -->|writes sidecars| FS
+    ATT -->|writes binaries| FS
+    MAN -->|writes cache| FS
 ```
 
-**Layer rules to preserve:**
+Layer rules to preserve:
 
-- The render layer is *pure* — `markdown::compose` borrows everything via
-  `RenderContext`, takes no `&mut`, and performs no I/O. All mutable
-  field-cache resolution happens up at the `export` seam.
-- `jira_client` is pure transport above the HTTP boundary; typed parsing into
-  `Issue` / `ChangelogEntry` / `IssueSearchResult` happens at that seam (see
-  ADR-0002).
-- `freshness::plan` is the *only* implementation of the incremental decision
-  (see ADR-0001). The single-export CLI path and `BulkExporter` both consult it
-  instead of re-deriving the rule.
+- The render layer is pure. `markdown::compose` borrows a `RenderContext`, takes
+  no mutable dependencies, performs no I/O, and makes no HTTP calls.
+- `jira_client` owns transport and pagination. Typed parsing into `Issue`,
+  `ChangelogEntry`, `IssueSearchResult`, and `ValidationIssue` happens at that
+  seam.
+- Incremental decisions go through `freshness::plan_metadata` or its
+  compatibility wrapper `freshness::plan`; callers should not re-derive
+  timestamp/artifact/fingerprint rules inline.
+- Manifest v2 is the source of cache truth for incremental state, hierarchy
+  edges, requested roots, artifact paths, evictions, and root snapshots.
 
-## Single-issue export flow
+## Single-Issue Export Flow
 
-What happens when you run `jarkdown-rs export PROJ-123`. Same flow is invoked
-by the library entry point `export_issue` and by `BulkExporter` per task.
+`jarkdown-rs export PROJ-123` has two phases when `--incremental` is enabled:
+cheap validation/planning first, then full export only when required. The
+library entry point `export_issue` runs the full export workflow directly
+because it does not expose every CLI cache-planning flag.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor User
-    participant CLI as main.rs<br/>handle_export
-    participant Plan as freshness::plan<br/>(if --incremental)
-    participant Exp as export::<br/>perform_export_with_options
+    participant CLI as main.rs handle_export
     participant API as JiraApiClient
-    participant Att as AttachmentHandler
-    participant FC as FieldMetadataCache
+    participant MAN as Manifest
+    participant Plan as freshness::plan_metadata
+    participant Exp as perform_export_with_options
     participant CL as changelog::write_artifacts
-    participant Comp as markdown::compose
     participant FS as Filesystem
 
     User->>CLI: jarkdown-rs export PROJ-123 [flags]
     CLI->>API: new(domain, email, token)
 
-    opt --incremental
-        CLI->>API: fetch_issue(KEY)
-        CLI->>Plan: plan(issue, manifest, ...)
-        alt Skip
-            Plan-->>CLI: ExportPlan::Skip
-            CLI-->>User: "unchanged, skipping"
-        else BackfillChangelogOnly
-            Plan-->>CLI: ExportPlan::BackfillChangelogOnly
-            CLI->>API: fetch_changelog(KEY)
-            CLI->>CL: write_artifacts(...)
-        else Full
-            Plan-->>CLI: ExportPlan::Full
+    opt --incremental and not --force
+        CLI->>MAN: load_from_path(manifest path)
+        CLI->>API: validate_issue_keys([KEY])
+        alt validation returns KEY
+            CLI->>Plan: plan_metadata(KEY, updated, manifest, options, output path)
+            alt Skip
+                Plan-->>CLI: ExportPlan::Skip
+                CLI->>MAN: record validation metadata
+                CLI->>MAN: save_to_path(...)
+                CLI-->>User: unchanged
+            else BackfillChangelogOnly
+                Plan-->>CLI: ExportPlan::BackfillChangelogOnly
+                CLI->>API: fetch_changelog(KEY)
+                CLI->>CL: write_artifacts(...)
+                CLI->>MAN: record validation metadata + new fingerprint
+                CLI->>MAN: save_to_path(...)
+                CLI-->>User: repaired sidecar
+            else Full
+                Plan-->>CLI: ExportPlan::Full
+            end
+        else successful validation omits active KEY
+            CLI->>MAN: evict(KEY, not_returned_by_validation_search)
+            CLI->>MAN: save_to_path(...)
+            CLI-->>User: cache entry evicted
+        else validation request fails
+            CLI-->>CLI: warn and fall through to full export
         end
     end
 
     CLI->>Exp: perform_export_with_options(...)
     Exp->>FS: create_dir_all(output_path)
     Exp->>API: fetch_issue(KEY)
-    API-->>Exp: Issue (typed spine + raw Value)
-
-    par Attachments (bounded by --attachment-concurrency)
-        Exp->>Att: download_all_attachments(...)
-        Att->>API: download_attachment(url) [N×]
-        API-->>Att: bytes
-        Att->>FS: write each file
-        Att-->>Exp: Vec<DownloadedAttachment>
-    and Field metadata
-        Exp->>FC: is_stale()?
-        opt stale
-            Exp->>API: fetch_fields()
-            Exp->>FC: save(fields)
-        end
-    end
-
-    opt issuetype == "Epic"
-        Exp->>API: search_jql("parent = KEY OR Epic Link = KEY")
-    end
-
-    opt --include-changelog
-        Exp->>API: fetch_changelog(KEY) [paginated]
-        Exp->>CL: write_artifacts → {KEY}.changelog.md
-    end
-
-    Exp->>Comp: compose(&RenderContext)
-    Comp-->>Exp: String (markdown body)
-    opt --include-json
-        Exp->>FS: write {KEY}.json (raw payload)
-    end
-    Exp->>FS: write {KEY}.md
+    API-->>Exp: Issue (typed spine + raw payload)
+    Exp->>API: fetch fields / child issues / changelog as flags require
+    Exp->>FS: write attachments, JSON, changelog sidecars, Markdown
     Exp-->>CLI: PathBuf
+    opt --incremental
+        CLI->>API: fetch_issue(KEY) for manifest metadata
+        CLI->>MAN: record_issue_with_fingerprint(...)
+        CLI->>MAN: save_to_path(...)
+    end
     CLI-->>User: success summary
 ```
 
-## Bulk concurrency model
+## Bulk and Query Export
 
-`BulkExporter` fans work out across N concurrent issue tasks using a tokio
-`Semaphore`. Each task internally runs the same `perform_export_with_options`
-workflow shown above, with its own `--attachment-concurrency` budget — so the
-effective parallelism is `concurrency × attachment_concurrency`.
+Bulk and query flat exports use one validation pass per invocation when
+`--incremental` is enabled and `--force` is not set. Each requested key then
+plans independently against the shared validation map.
 
 ```mermaid
 flowchart LR
-    keys["issue_keys: Vec&lt;String&gt;"] --> stream{{"stream::iter<br/>buffer_unordered"}}
+    keys["requested keys"] --> validate{"--incremental<br/>and not --force?"}
+    validate -->|yes| jira["validate_issue_keys(keys)<br/>updated + display metadata"]
+    validate -->|no| stream
+    jira --> stream{{"stream::iter<br/>buffer_unordered(concurrency)"}}
 
-    subgraph sem["Semaphore(concurrency=N)"]
-        T1["task: KEY-1<br/>perform_export_with_options"]
-        T2["task: KEY-2<br/>perform_export_with_options"]
-        T3["task: KEY-3<br/>perform_export_with_options"]
-        Tn["task: KEY-…"]
+    subgraph task["per-key task"]
+        plan["freshness::plan_metadata"]
+        skip["Skip<br/>record metadata"]
+        backfill["BackfillChangelogOnly<br/>fetch changelog only"]
+        evict["Validation omitted active key<br/>evict tombstone"]
+        full["Full export<br/>perform_export_with_options"]
     end
 
-    stream --> T1
-    stream --> T2
-    stream --> T3
-    stream --> Tn
-
-    T1 --> tout1{"time::timeout<br/>issue_timeout_seconds"}
-    T2 --> tout2{"time::timeout"}
-    T3 --> tout3{"time::timeout"}
-    Tn --> toutn{"time::timeout"}
-
-    tout1 --> R[(ExportResult)]
-    tout2 --> R
-    tout3 --> R
-    toutn --> R
-
-    R --> split{success?}
-    split -->|true| succ["successes: Vec&lt;ExportResult&gt;"]
-    split -->|false| fail["failures: Vec&lt;ExportResult&gt;"]
-
-    succ --> idx["write_index_md → index.md"]
-    fail --> idx
-    succ --> manup["Manifest.record<br/>(if --incremental)"]
+    stream --> plan
+    plan --> skip
+    plan --> backfill
+    plan --> evict
+    plan --> full
+    full --> result["ExportResult"]
+    skip --> result
+    backfill --> result
+    evict --> result
+    result --> manifest["merge manifest updates<br/>save_to_path"]
+    result --> index["bulk/query index.md"]
 ```
 
-Per-task incremental short-circuit lives at the top of each task and consults
-`freshness::plan` — unchanged issues never enter the full workflow.
+Per-task full export still uses the same attachment concurrency and timeout
+rules as non-incremental export. `query --keys-only` stops after printing keys;
+it does not write artifacts or manifests.
 
-## Hierarchy traversal
+## Hierarchy Export and Layouts
 
-`--hierarchy` builds an `IssueNode` tree and writes each issue under its
-parent's directory. The seam (`IssueExporter` trait) lets the production
-implementation delegate to `perform_export_with_options` while tests can
-substitute a recording fake.
+`--hierarchy` builds an `IssueNode` tree. The production `IssueExporter`
+delegates each Issue artifact write to `perform_export_with_options`, while
+tests can substitute a fake exporter. Layout determines where artifacts are
+written:
+
+- `corpus`: one canonical directory per Issue under the output root, plus a
+  `{ROOT}.hierarchy.md` snapshot.
+- `nested`: tree-shaped directories for browsing, plus `index.md`.
+
+`--incremental --hierarchy` defaults to `corpus` because it best matches
+shared-cache semantics. Non-incremental hierarchy export keeps the legacy nested
+default.
 
 ```mermaid
 flowchart TB
-    start([export_hierarchy: root_key])
-    epic{Resolve<br/>'Epic Link'<br/>field id}
+    start([export_hierarchy root])
     build["build_tree(key, dir, depth)"]
-    cycle{"key in<br/>visited?"}
-    cap{"depth ≥ max_depth<br/>OR<br/>count ≥ max_issues?"}
-    exp["IssueExporter.export(key, dir)<br/>→ perform_export_with_options"]
-    fetch["JiraApiClient.fetch_issue(key)<br/>for child discovery"]
-    disc["Discover children:<br/>· subtasks<br/>· issuelinks (parent + 'is implemented by')<br/>· JQL: parent=K OR EpicLink=K"]
-    dedup["Dedup + preserve order"]
-    recurse["recurse into each child<br/>(depth+1, dir/key)"]
-    leaf[("IssueNode<br/>{ key, summary, type, children }")]
-    index["render_index → index.md"]
+    stack{"key in recursion stack?"}
+    emitted{"key already emitted<br/>outside current stack?"}
+    export["IssueExporter.export(key, dir)<br/>writes current artifact path"]
+    fetch["fetch_issue(key)<br/>for child discovery"]
+    cap{"depth >= max_depth<br/>or count >= max_issues?"}
+    discover["discover children:<br/>subtasks, parent links,<br/>JPD delivery links, Epic Link JQL"]
+    recurse["recurse children"]
+    node["IssueNode"]
+    snapshot["render root snapshot/index"]
 
-    start --> epic --> build --> cycle
-    cycle -->|yes| leaf
-    cycle -->|no| exp --> fetch --> cap
-    cap -->|yes| leaf
-    cap -->|no| disc --> dedup --> recurse --> leaf
-    leaf --> index
+    start --> build --> stack
+    stack -->|yes cycle| node
+    stack -->|no| emitted
+    emitted -->|yes shared child| export --> node
+    emitted -->|no| export --> fetch --> cap
+    cap -->|yes truncated| node
+    cap -->|no| discover --> recurse --> node
+    node --> snapshot
 ```
 
-## Incremental freshness decision (ADR-0001)
+The traversal distinguishes recursion-stack cycle prevention from non-cyclic
+shared-child revisits. A shared child can be written at multiple nested paths and
+recorded under multiple parent edges without duplicating child discovery.
 
-The `--incremental` skip rule is implemented in exactly one place. Both the
-single-export CLI handler and `BulkExporter` call `freshness::plan` and act on
-its `ExportPlan` instead of re-deriving the rule.
+## Child-Aware Incremental Hierarchy
+
+Warm hierarchy planning validates the current Requested Root plus its active
+cached descendants. Successful validation omissions evict only the omitted
+active keys and continue planning the remaining validated descendants. Failed
+validation requests evict nothing.
+
+```mermaid
+flowchart TB
+    load["load manifest v2"]
+    tree{"cached root snapshot exists?"}
+    keys["active_hierarchy_keys(root)"]
+    validate["validate current root + active descendants"]
+    missing["evict validation omissions"]
+    plan["plan_metadata for each validated key/path"]
+    allskip{"all Skip?"}
+    changed{"descendant changed<br/>or sidecar missing?"}
+    rootdirty{"root needs Full<br/>or Backfill?"}
+    refresh["refresh changed descendants only"]
+    cached["return cached_hierarchy_tree(root)"]
+    full["fall back to full hierarchy traversal"]
+
+    load --> tree
+    tree -->|no| full
+    tree -->|yes| keys --> validate --> missing --> plan
+    plan --> allskip
+    allskip -->|yes| cached
+    allskip -->|no| rootdirty
+    rootdirty -->|yes| full
+    rootdirty -->|no| changed --> refresh --> cached
+```
+
+Changed leaf descendants are re-exported directly. Changed descendants with
+active children are refreshed as bounded subtrees. The subtree depth is computed
+from the remaining depth below active Requested-Root paths, taking the maximum
+remaining depth across paths. In nested layout, refresh writes a changed shared
+Issue to every active artifact path recorded for it.
+
+Root snapshots are traversal snapshots, not live views. Descendant-only refresh
+does not rebuild unchanged ancestor snapshots.
+
+## Freshness Decision
+
+`freshness::plan_metadata` combines manifest state, parsed Jira timestamps,
+artifact presence, and content-visible option fingerprints.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> CheckManifest
-    CheckManifest --> Full: manifest.is_stale(key, updated)
-    CheckManifest --> CheckChangelogFlag: timestamps match
+    [*] --> ActiveEntry
+    ActiveEntry --> Full: no active entry
+    ActiveEntry --> Timestamp
 
-    CheckChangelogFlag --> Skip: --include-changelog OFF
-    CheckChangelogFlag --> CheckArtifact: --include-changelog ON
+    Timestamp --> Full: incoming newer
+    Timestamp --> Options: equal or incoming older
+    Timestamp --> StringFallback: parse failed
+    StringFallback --> Full: strings differ
+    StringFallback --> Options: strings equal
 
-    CheckArtifact --> Skip: {KEY}.changelog.md exists
-    CheckArtifact --> BackfillChangelogOnly: file missing
+    Options --> Full: fingerprint changed
+    Options --> MainMd: same fingerprint
+    Options --> MainMd: only include_changelog changed
 
-    Skip --> [*]: no I/O
-    BackfillChangelogOnly --> [*]: fetch + write changelog only<br/>(issue payload not re-fetched)
+    MainMd --> Full: {KEY}.md missing
+    MainMd --> Json: main Markdown exists
+    Json --> Full: --include-json and {KEY}.json missing
+    Json --> Changelog: JSON ok
+    Changelog --> BackfillChangelogOnly: --include-changelog and changelog sidecar missing
+    Changelog --> Skip: required artifacts present
+
+    Skip --> [*]: no artifact writes
+    BackfillChangelogOnly --> [*]: fetch/write changelog only
     Full --> [*]: standard export workflow
 ```
 
-## Render pipeline (pure)
+Timestamp parsing accepts RFC3339 and Jira's `%Y-%m-%dT%H:%M:%S%.f%z` shape. An
+older parsed validation timestamp warns and does not regress the stored manifest
+timestamp.
 
-`markdown::compose` builds a Markdown file body from a borrowed
-`RenderContext`. The context is constructed exactly once at the `export` seam,
-with all mutable work (HTTP, field-cache resolution, attachment downloads)
-already done. Section order is load-bearing for `--strict-md` byte-identity
-against the baseline.
+## Render Pipeline
+
+`markdown::compose` builds Markdown from a borrowed `RenderContext`. All mutable
+work (HTTP, field-cache resolution, attachment downloads, changelog fetches) is
+complete before the context is constructed.
 
 ```mermaid
 flowchart LR
-    subgraph build["Built at export seam (mutable work done here)"]
-        ISS["Issue<br/>(typed + raw)"]
-        DLA["Vec&lt;DownloadedAttachment&gt;"]
-        SKA["skipped_attachments<br/>(--no-attachments)"]
-        CFM["CustomFieldMetadata<br/>names + schemas"]
-        FF["FieldFilter"]
-        CH["child_issues: &amp;[Value]"]
-        CLS["Option&lt;ChangelogSummary&gt;"]
+    subgraph build["Built at export seam"]
+        ISS["Issue"]
+        DLA["DownloadedAttachment list"]
+        SKA["skipped attachments"]
+        CFM["field metadata"]
+        FF["field filters"]
+        CH["child Issues"]
+        CLS["optional changelog summary"]
     end
 
-    RC["RenderContext (borrowed)"]
-    AI["AttachmentIndex::build(dl, sk)"]
-
-    ISS --> RC
-    DLA --> AI --> RC
+    ISS --> RC["RenderContext"]
+    DLA --> AI["AttachmentIndex"] --> RC
     SKA --> AI
-    SKA --> RC
     CFM --> RC
     FF --> RC
     CH --> RC
     CLS --> RC
-
-    RC --> COMPOSE["compose(&amp;ctx) → String"]
-
-    COMPOSE --> S1["frontmatter"]
-    COMPOSE --> S2["title"]
-    COMPOSE --> S3["description"]
-    COMPOSE --> S4["environment"]
-    COMPOSE --> S5["linked_issues"]
-    COMPOSE --> S6["subtasks"]
-    COMPOSE --> S7["child_issues"]
-    COMPOSE --> S8["worklogs"]
-    COMPOSE --> S9["custom_fields"]
-    COMPOSE --> S10["comments"]
-    COMPOSE --> S11["changelog (xref)"]
-    COMPOSE --> S12["attachments"]
-
-    S3 --> ADF[markdown::adf]
-    S3 --> HTML[markdown::html]
-    S10 --> ADF
-    S10 --> HTML
-    S9 --> CFR[custom_field::<br/>CustomFieldRenderer]
-    S12 --> AI
+    RC --> COMPOSE["markdown::compose"]
+    COMPOSE --> MD["{KEY}.md"]
 ```
 
-**Why pure:** the render layer never touches `&mut FieldMetadataCache`, never
-hits HTTP, never writes files. This is what makes `compose` trivially
-reproducible — given the same `RenderContext`, the same bytes come out. Any
-future caller (a different output format, a test fixture, an in-memory
-preview) can build a `RenderContext` and reuse the entire composer.
+The render layer never touches `FieldMetadataCache`, HTTP clients, or the
+filesystem. Given the same `RenderContext`, it should produce the same bytes.
 
-## Typed Issue + raw payload duality (ADR-0002)
+## Typed Issue + Raw Payload Duality
 
-`JiraApiClient::fetch_issue` parses Jira's JSON into a typed `Issue` but
-*retains the original `Value`* in `Issue.raw`. The typed spine drives logic;
-`raw` drives `--include-json` byte-identity and custom-field lookup. Deleting
-`raw` looks like duplication — it is not.
+`JiraApiClient::fetch_issue` parses Jira JSON into a typed `Issue` and keeps the
+original `serde_json::Value` in `Issue.raw`.
 
 ```mermaid
 flowchart LR
-    JIRA[(Jira API<br/>raw JSON)]
-    PARSE["Issue::from_value(value)"]
-
-    JIRA --> PARSE
-
-    subgraph issue["Issue (one struct, two views)"]
-        TYPED["Typed spine (~12 fields)<br/>key · summary · updated<br/>issuetype · status · priority<br/>project · assignee · ...<br/><b>parse failure here = hard error</b>"]
-        RAW["raw: serde_json::Value<br/>(untouched)<br/><b>~30 standard + N custom fields</b>"]
-    end
-
-    PARSE --> TYPED
-    PARSE --> RAW
-
-    TYPED --> LOGIC["Business logic:<br/>· hierarchy traversal<br/>· field filtering<br/>· markdown sections<br/>· freshness check"]
-
-    RAW --> JSONOUT["{KEY}.json<br/>(--include-json)<br/><b>byte-identical to Jira</b>"]
-    RAW --> CF["custom field reads<br/>via Issue.field(name)"]
-    RAW --> CHILD["unmodeled<br/>standard fields"]
+    JIRA[(Jira raw JSON)] --> PARSE["Issue::from_value"]
+    PARSE --> TYPED["typed spine<br/>key, summary, updated,<br/>type, status, project, ..."]
+    PARSE --> RAW["raw payload"]
+    TYPED --> LOGIC["business logic<br/>freshness, hierarchy,<br/>render sections"]
+    RAW --> JSON["{KEY}.json<br/>(--include-json)"]
+    RAW --> CUSTOM["custom field reads"]
 ```
 
-**Concretely:** if `Jira returns "updated": 12345` (wrong type) we fail fast at
-the HTTP seam — schema drift on the narrow stable spine is a real bug. But if
-`customfield_98765` returns an unfamiliar ADF shape, nothing fails; that data
-lives only in `raw` and is parsed only on demand by the section renderers.
+Wrong types in the narrow stable spine are hard errors. Unknown or changing
+custom-field shapes remain in `raw` and are interpreted only by field renderers
+that opt into them.
 
-## Attachment download pipeline
+## Attachment Download Pipeline
 
-Two-phase: filename resolution is synchronous (no races); downloads run
+Filename resolution is synchronous and deterministic; downloads run
 concurrently bounded by `--attachment-concurrency`. `--no-attachments` skips
-phase 2 entirely, but the renderer still emits each attachment's original
-Jira URL via `AttachmentIndex::skipped_*` so links never break.
+binary downloads while preserving source Jira URLs in rendered Markdown.
 
 ```mermaid
 flowchart LR
-    A["issue.attachments<br/>Vec&lt;Value&gt;"]
-    P1["Phase 1 (sync):<br/>resolve_filename per attachment<br/>HashSet&lt;String&gt; tracks used names<br/>conflicts → 'name_1.ext', 'name_2.ext', ..."]
-    P2["Phase 2 (async):<br/>stream::buffer_unordered(N)<br/>download_attachment_to(path)"]
-    OUT["Vec&lt;DownloadedAttachment&gt;<br/>{ filename, original_filename,<br/>mime_type, path }"]
-    SKIP{"--no-attachments?"}
-    AI["AttachmentIndex::build(<br/>  downloaded, skipped)"]
-
-    A --> SKIP
-    SKIP -->|no| P1 --> P2 --> OUT --> AI
-    SKIP -->|yes| AI
+    A["issue.attachments"] --> skip{"--no-attachments?"}
+    skip -->|yes| index["AttachmentIndex<br/>source URLs"]
+    skip -->|no| names["resolve filenames<br/>dedupe conflicts"]
+    names --> downloads["buffer_unordered(N)<br/>download_attachment"]
+    downloads --> files["write files"]
+    files --> index["AttachmentIndex"]
 ```
 
-The index dual-keys downloaded attachments (by `id`, by `original_filename`,
-and by the conflict-resolved local `filename`) and single-keys skipped ones
-(by `id` and `filename`). Lookups in `markdown::adf` / `markdown::sections`
-normalize via `.trim().to_lowercase()` and try id first, then name hint.
-
-## Where to look in the source
+## Where to Look in the Source
 
 | Concern | File |
 |---|---|
 | CLI parsing | `src/cli.rs`, `src/main.rs` |
 | Library entry point | `src/lib.rs` |
-| Single-export orchestration | `src/export.rs` |
-| Bulk concurrency | `src/bulk.rs` |
+| Single-export workflow | `src/export.rs` |
+| Flat bulk/query orchestration | `src/bulk.rs`, `src/main.rs` |
 | Hierarchy traversal | `src/hierarchy.rs`, `src/exporter.rs` |
+| Hierarchy warm planning | `src/main.rs` |
 | HTTP transport | `src/jira_client.rs`, `src/retry.rs` |
-| Typed issue model | `src/issue.rs` |
+| Typed Issue model | `src/issue.rs` |
 | Incremental decision | `src/freshness.rs`, `src/manifest.rs` |
-| Render pipeline (pure) | `src/markdown/{mod,sections,adf,html,attachments}.rs` |
+| Manifest v2 cache | `src/manifest.rs`, `docs/manifest-v2.md` |
+| Render pipeline | `src/markdown/{mod,sections,adf,html,attachments}.rs` |
 | Custom field rendering | `src/custom_field.rs` |
 | Changelog rendering | `src/changelog.rs` |
 | Field metadata cache | `src/field_cache.rs` |

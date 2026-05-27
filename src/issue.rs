@@ -110,8 +110,8 @@ pub struct TimeTracking {
 }
 
 /// `fields.progress` / `fields.aggregateprogress` — present unconditionally.
-/// `percent` defaults to `0` when absent (load-bearing: the PSOP-5624
-/// baseline payload omits `percent`, and the renderer prints `0`).
+/// `percent` defaults to `0` when absent (load-bearing: Jira can omit
+/// `percent`, and the renderer still prints `0`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Progress {
     pub percent: u64,
@@ -425,8 +425,8 @@ fn parse_timetracking(v: &Value) -> Result<TimeTracking> {
 
 /// A `u64` field that absent/null → 0; a present non-integer is hard schema
 /// drift. The default `0` is load-bearing for `progress.percent`,
-/// `votes.votes`, and `watches.watchCount`: the PSOP-5624 baseline omits
-/// `percent` and the renderer still prints `0`.
+/// `votes.votes`, and `watches.watchCount`: Jira can omit `percent` and the
+/// renderer still prints `0`.
 fn parse_u64(v: &Value, field: &str) -> Result<u64> {
     match v {
         Value::Null => Ok(0),
@@ -873,8 +873,7 @@ mod tests {
 
     #[test]
     fn changelog_entry_from_value_tolerates_absent_author_but_rejects_wrong_types() {
-        // (a) Some system-generated entries omit `author` entirely (mirrors
-        // PSOP-5624 entry id=9827921 in the baseline).
+        // (a) Some system-generated entries omit `author` entirely.
         let ok = ChangelogEntry::from_value(json!({
             "id": "9827921",
             "created": "2026-05-06T15:52:53.582-0700",
