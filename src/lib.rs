@@ -50,7 +50,7 @@ pub use export::{perform_export, perform_export_with_options, ExportWorkflowOpti
 pub use exporter::{IssueExporter, WorkflowIssueExporter};
 pub use field_cache::FieldMetadataCache;
 pub use freshness::{plan as plan_export, ExportPlan};
-pub use hierarchy::{HierarchyExporter, HierarchyOptions, IssueNode};
+pub use hierarchy::{HierarchyExporter, HierarchyLayout, HierarchyOptions, IssueNode};
 pub use issue::{ChangelogEntry, ChangelogItem, Comment, Issue, IssueSearchResult, RichText};
 pub use jira_client::JiraApiClient;
 pub use manifest::Manifest;
