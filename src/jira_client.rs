@@ -9,6 +9,18 @@ use crate::error::{JarkdownError, Result};
 use crate::issue::{ChangelogEntry, Issue, IssueSearchResult};
 use crate::retry::{retry_with_backoff, RetryConfig};
 
+const VALIDATION_CHUNK_SIZE: usize = 50;
+const VALIDATION_PAGE_SIZE: u32 = 50;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationIssue {
+    pub key: String,
+    pub updated: String,
+    pub summary: Option<String>,
+    pub issue_type: Option<String>,
+    pub status: Option<String>,
+}
+
 /// Handles all communication with the Jira Cloud REST API.
 #[derive(Debug, Clone)]
 pub struct JiraApiClient {
@@ -54,7 +66,6 @@ impl JiraApiClient {
         })
     }
 
-    #[cfg(test)]
     pub fn new_for_test(base_url: &str) -> Self {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -110,11 +121,7 @@ impl JiraApiClient {
     }
 
     /// Search for issues matching a JQL query, paginating via nextPageToken.
-    pub async fn search_jql(
-        &self,
-        jql: &str,
-        max_results: u32,
-    ) -> Result<Vec<IssueSearchResult>> {
+    pub async fn search_jql(&self, jql: &str, max_results: u32) -> Result<Vec<IssueSearchResult>> {
         let url = format!("{}/search/jql", self.api_base);
         let mut issues: Vec<Value> = Vec::new();
         let mut next_page_token: Option<String> = None;
@@ -178,6 +185,51 @@ impl JiraApiClient {
             .collect()
     }
 
+    /// Validate Issue freshness through Jira search using only cache metadata fields.
+    pub async fn validate_issue_keys(&self, issue_keys: &[String]) -> Result<Vec<ValidationIssue>> {
+        let mut keys: Vec<String> = issue_keys
+            .iter()
+            .map(|key| key.trim().to_ascii_uppercase())
+            .filter(|key| !key.is_empty())
+            .collect();
+        keys.sort();
+        keys.dedup();
+
+        let mut out = Vec::new();
+        for chunk in keys.chunks(VALIDATION_CHUNK_SIZE) {
+            let jql = validation_jql(chunk);
+            let mut next_page_token: Option<String> = None;
+
+            loop {
+                let mut query_params: Vec<(String, String)> = vec![
+                    ("jql".into(), jql.clone()),
+                    ("maxResults".into(), VALIDATION_PAGE_SIZE.to_string()),
+                    ("fields".into(), "updated,summary,issuetype,status".into()),
+                ];
+                if let Some(ref token) = next_page_token {
+                    query_params.push(("nextPageToken".into(), token.clone()));
+                }
+
+                let url = format!("{}/search/jql", self.api_base);
+                let response = self.client.get(&url).query(&query_params).send().await?;
+                let data = Self::handle_response(response, None).await?;
+                let page_issues = data["issues"].as_array().cloned().unwrap_or_default();
+                let page_empty = page_issues.is_empty();
+                out.extend(
+                    page_issues
+                        .into_iter()
+                        .filter_map(validation_issue_from_value),
+                );
+                next_page_token = data["nextPageToken"].as_str().map(|s| s.to_string());
+                if next_page_token.is_none() || page_empty {
+                    break;
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
     /// Get the download URL for an attachment.
     pub fn get_attachment_content_url(attachment: &Value) -> String {
         attachment["content"].as_str().unwrap_or("").to_string()
@@ -217,6 +269,30 @@ impl JiraApiClient {
         }
         Ok(response.json().await?)
     }
+}
+
+fn validation_jql(keys: &[String]) -> String {
+    let quoted = keys
+        .iter()
+        .map(|key| format!("\"{}\"", key.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("key in ({})", quoted)
+}
+
+fn validation_issue_from_value(value: Value) -> Option<ValidationIssue> {
+    let key = value["key"].as_str()?.trim().to_ascii_uppercase();
+    if key.is_empty() {
+        return None;
+    }
+    let fields = &value["fields"];
+    Some(ValidationIssue {
+        key,
+        updated: fields["updated"].as_str().unwrap_or_default().to_string(),
+        summary: fields["summary"].as_str().map(str::to_string),
+        issue_type: fields["issuetype"]["name"].as_str().map(str::to_string),
+        status: fields["status"]["name"].as_str().map(str::to_string),
+    })
 }
 
 impl JiraApiClient {
@@ -294,9 +370,73 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn validate_issue_keys_chunks_paginates_and_fetches_metadata_fields() {
+        let server = ValidationServer::start();
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let keys: Vec<String> = (1..=51).map(|n| format!("proj-{}", n)).collect();
+
+        let results = client
+            .validate_issue_keys(&keys)
+            .await
+            .expect("validate issue keys");
+
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().any(|issue| issue.key == "PROJ-1"));
+        let first = results.iter().find(|issue| issue.key == "PROJ-1").unwrap();
+        assert_eq!(first.updated, "2026-01-01T00:00:00.000+0000");
+        assert_eq!(first.summary.as_deref(), Some("One"));
+        assert_eq!(first.issue_type.as_deref(), Some("Task"));
+        assert_eq!(first.status.as_deref(), Some("Open"));
+        assert!(
+            server
+                .observed_paths()
+                .iter()
+                .any(|path| path.contains("nextPageToken=page-2")),
+            "validation did not paginate: {:?}",
+            server.observed_paths()
+        );
+        assert_eq!(
+            server
+                .observed_paths()
+                .iter()
+                .filter(|path| path.contains("/rest/api/3/search/jql"))
+                .count(),
+            3,
+            "expected first chunk page 1, first chunk page 2, and second chunk request"
+        );
+    }
+
     struct PaginatedChangelogServer {
         base_url: String,
         requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct ValidationServer {
+        base_url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ValidationServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let base_url = format!("http://{}", addr);
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let requests_for_thread = requests.clone();
+
+            thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    handle_validation_request(stream, &requests_for_thread);
+                }
+            });
+
+            Self { base_url, requests }
+        }
+
+        fn observed_paths(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
     }
 
     impl PaginatedChangelogServer {
@@ -356,6 +496,38 @@ mod tests {
             } else {
                 r#"{"startAt":0,"maxResults":0,"total":0,"isLast":true,"values":[]}"#.to_string()
             }
+        } else {
+            "{}".to_string()
+        };
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(resp.as_bytes()).expect("write");
+    }
+
+    fn handle_validation_request(mut stream: TcpStream, requests: &Arc<Mutex<Vec<String>>>) {
+        let mut buf = [0u8; 8192];
+        let n = stream.read(&mut buf).expect("read");
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let path = req
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_string();
+        requests.lock().unwrap().push(path.clone());
+
+        let body = if path.contains("nextPageToken=page-2") {
+            r#"{"issues":[{"key":"PROJ-2","fields":{"updated":"2026-01-02T00:00:00.000+0000","summary":"Two","issuetype":{"name":"Bug"},"status":{"name":"Done"}}}]}"#
+                .to_string()
+        } else if path.contains("PROJ-51") {
+            r#"{"issues":[{"key":"PROJ-51","fields":{"updated":"2026-01-51T00:00:00.000+0000","summary":"Fifty one","issuetype":{"name":"Task"},"status":{"name":"Open"}}}]}"#
+                .to_string()
+        } else if path.contains("/rest/api/3/search/jql") {
+            r#"{"nextPageToken":"page-2","issues":[{"key":"PROJ-1","fields":{"updated":"2026-01-01T00:00:00.000+0000","summary":"One","issuetype":{"name":"Task"},"status":{"name":"Open"}}}]}"#
+                .to_string()
         } else {
             "{}".to_string()
         };

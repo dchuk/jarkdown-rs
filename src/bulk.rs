@@ -16,10 +16,12 @@ use log::info;
 
 use crate::error::Result;
 use crate::export::{perform_export_with_options, ExportWorkflowOptions};
-use crate::freshness::{self, ExportPlan};
-use crate::issue::Issue;
-use crate::jira_client::JiraApiClient;
-use crate::manifest::Manifest;
+use crate::freshness::{self, ExportPlan, PlanOptions};
+use crate::jira_client::{JiraApiClient, ValidationIssue};
+use crate::manifest::{
+    default_manifest_path, export_option_fingerprint, normalize_issue_key, relative_artifact_path,
+    Manifest,
+};
 
 /// Result of a single issue export attempt.
 #[derive(Debug, Clone)]
@@ -28,6 +30,31 @@ pub struct ExportResult {
     pub success: bool,
     pub output_path: Option<PathBuf>,
     pub error: Option<String>,
+}
+
+struct BulkTaskOutcome {
+    result: ExportResult,
+    manifest_update: Option<ManifestUpdate>,
+}
+
+enum ManifestUpdate {
+    Validated(ManifestValidationUpdate),
+    Evicted { issue_key: String, reason: String },
+}
+
+struct ManifestValidationUpdate {
+    issue: ValidationIssue,
+    artifact_path: String,
+    option_fingerprint: Option<String>,
+}
+
+impl From<ExportResult> for BulkTaskOutcome {
+    fn from(result: ExportResult) -> Self {
+        Self {
+            result,
+            manifest_update: None,
+        }
+    }
 }
 
 /// Orchestrates concurrent export of multiple Jira issues.
@@ -45,6 +72,7 @@ pub struct BulkExporter {
     incremental: bool,
     force: bool,
     include_changelog: bool,
+    manifest_path: Option<PathBuf>,
 }
 
 impl BulkExporter {
@@ -83,7 +111,13 @@ impl BulkExporter {
             incremental,
             force,
             include_changelog: false,
+            manifest_path: None,
         }
+    }
+
+    pub fn with_manifest_path(mut self, manifest_path: Option<&str>) -> Self {
+        self.manifest_path = manifest_path.map(PathBuf::from);
+        self
     }
 
     pub fn with_include_changelog(mut self, include_changelog: bool) -> Self {
@@ -113,13 +147,52 @@ impl BulkExporter {
         let stderr_is_terminal = std::io::stderr().is_terminal();
 
         // Load manifest for incremental support
+        let manifest_path = self
+            .manifest_path
+            .clone()
+            .unwrap_or_else(|| default_manifest_path(&self.output_dir));
         let manifest = if self.incremental {
-            Some(Manifest::load(&self.output_dir))
+            match Manifest::load_from_path(&manifest_path) {
+                Ok(manifest) => Some(manifest),
+                Err(e) => {
+                    let failures = issue_keys
+                        .iter()
+                        .map(|key| ExportResult {
+                            issue_key: key.clone(),
+                            success: false,
+                            output_path: None,
+                            error: Some(e.to_string()),
+                        })
+                        .collect();
+                    return (Vec::new(), failures);
+                }
+            }
         } else {
             None
         };
+        let (validation_succeeded, validation) = if self.incremental && !self.force {
+            match self.api_client.validate_issue_keys(issue_keys).await {
+                Ok(results) => (
+                    true,
+                    results
+                        .into_iter()
+                        .map(|issue| (normalize_issue_key(&issue.key), issue))
+                        .collect::<HashMap<_, _>>(),
+                ),
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to validate incremental manifest through Jira search: {}",
+                        e
+                    );
+                    (false, HashMap::new())
+                }
+            }
+        } else {
+            (false, HashMap::new())
+        };
+        let validation = Arc::new(validation);
 
-        let results: Vec<ExportResult> = stream::iter(issue_keys.iter().enumerate())
+        let outcomes: Vec<BulkTaskOutcome> = stream::iter(issue_keys.iter().enumerate())
             .map(|(i, key)| {
                 let sem = self.semaphore.clone();
                 let client = self.api_client.clone();
@@ -135,6 +208,10 @@ impl BulkExporter {
                 let manifest_ref = manifest.clone();
                 let force = self.force;
                 let include_changelog = self.include_changelog;
+                let option_fingerprint =
+                    export_option_fingerprint(inc.as_deref(), exc.as_deref(), no_attachments);
+                let validation = validation.clone();
+                let validation_succeeded = validation_succeeded;
 
                 async move {
                     let _permit = sem.acquire().await.unwrap();
@@ -145,10 +222,12 @@ impl BulkExporter {
 
                     let key_for_timeout = key.clone();
                     let export = async {
-                        // Incremental check: fetch issue metadata to compare timestamps
+                        // Incremental check: validate metadata once per invocation before
+                        // deciding whether this Issue needs a full export.
                         if let Some(ref m) = manifest_ref {
                             if !force {
-                                if let Ok(issue) = client.fetch_issue(&key).await {
+                                let normalized_key = normalize_issue_key(&key);
+                                if let Some(validated) = validation.get(&normalized_key) {
                                     let path = output_dir.join(&key);
                                     let unchanged = ExportResult {
                                         issue_key: key.clone(),
@@ -156,21 +235,81 @@ impl BulkExporter {
                                         output_path: Some(path.clone()),
                                         error: None,
                                     };
-                                    match freshness::plan(&issue, m, include_changelog, &path) {
+                                    match freshness::plan_metadata(
+                                        &key,
+                                        &validated.updated,
+                                        m,
+                                        PlanOptions {
+                                            include_changelog,
+                                            include_json: json,
+                                            option_fingerprint: option_fingerprint.as_deref(),
+                                        },
+                                        &path,
+                                    ) {
                                         ExportPlan::Skip => {
                                             info!("Skipping {} (unchanged)", key);
-                                            return unchanged;
+                                            return BulkTaskOutcome {
+                                                result: unchanged,
+                                                manifest_update: Some(ManifestUpdate::Validated(
+                                                    ManifestValidationUpdate {
+                                                        issue: validated.clone(),
+                                                        artifact_path: relative_artifact_path(
+                                                            &output_dir,
+                                                            &path,
+                                                        ),
+                                                        option_fingerprint: option_fingerprint
+                                                            .clone(),
+                                                    },
+                                                )),
+                                            };
                                         }
                                         ExportPlan::BackfillChangelogOnly => {
                                             // Changelog opt-in is on but the file is
                                             // missing (e.g. the flag was just enabled);
                                             // write it without re-fetching the payload.
-                                            backfill_changelog(&client, &key, &path, &issue, json)
-                                                .await;
-                                            return unchanged;
+                                            let summary = validated
+                                                .summary
+                                                .as_deref()
+                                                .or_else(|| {
+                                                    m.get(&key)
+                                                        .and_then(|entry| entry.summary.as_deref())
+                                                })
+                                                .unwrap_or(&validated.key);
+                                            backfill_changelog_with_summary(
+                                                &client, &key, summary, &path, json,
+                                            )
+                                            .await;
+                                            return BulkTaskOutcome {
+                                                result: unchanged,
+                                                manifest_update: Some(ManifestUpdate::Validated(
+                                                    ManifestValidationUpdate {
+                                                        issue: validated.clone(),
+                                                        artifact_path: relative_artifact_path(
+                                                            &output_dir,
+                                                            &path,
+                                                        ),
+                                                        option_fingerprint: option_fingerprint
+                                                            .clone(),
+                                                    },
+                                                )),
+                                            };
                                         }
                                         ExportPlan::Full => {}
                                     }
+                                } else if validation_succeeded && m.is_active(&key) {
+                                    info!("Evicting {} (not returned by validation search)", key);
+                                    return BulkTaskOutcome {
+                                        result: ExportResult {
+                                            issue_key: key.clone(),
+                                            success: true,
+                                            output_path: Some(output_dir.join(&key)),
+                                            error: None,
+                                        },
+                                        manifest_update: Some(ManifestUpdate::Evicted {
+                                            issue_key: key,
+                                            reason: "not_returned_by_validation_search".to_string(),
+                                        }),
+                                    };
                                 }
                             }
                         }
@@ -205,10 +344,14 @@ impl BulkExporter {
                                 error: Some(e.to_string()),
                             },
                         }
+                        .into()
                     };
 
                     let result = timeout_export(&key_for_timeout, issue_timeout, export).await;
-                    emit_progress(stderr_is_terminal, &finish_message(i + 1, total, &result));
+                    emit_progress(
+                        stderr_is_terminal,
+                        &finish_message(i + 1, total, &result.result),
+                    );
                     result
                 }
             })
@@ -223,21 +366,64 @@ impl BulkExporter {
         // Update manifest with successful exports
         if self.incremental {
             let mut manifest = manifest.unwrap_or_default();
-            for r in &results {
+            for outcome in &outcomes {
+                if let Some(update) = &outcome.manifest_update {
+                    match update {
+                        ManifestUpdate::Validated(update) => {
+                            manifest.record_metadata_with_fingerprint(
+                                &update.issue.key,
+                                &update.issue.updated,
+                                update.issue.summary.as_deref(),
+                                update.issue.issue_type.as_deref(),
+                                update.issue.status.as_deref(),
+                                update.artifact_path.clone(),
+                                update.option_fingerprint.as_deref(),
+                            );
+                        }
+                        ManifestUpdate::Evicted { issue_key, reason } => {
+                            manifest.evict(issue_key, reason);
+                        }
+                    }
+                    continue;
+                }
+                let r = &outcome.result;
                 if r.success {
-                    // We record the current time as a proxy; the actual `updated`
-                    // field will be compared on the next run.
-                    manifest.record(&r.issue_key, &Utc::now().to_rfc3339());
+                    match self.api_client.fetch_issue(&r.issue_key).await {
+                        Ok(issue) => {
+                            let artifact_path = r
+                                .output_path
+                                .as_ref()
+                                .map(|path| relative_artifact_path(&self.output_dir, path))
+                                .unwrap_or_else(|| r.issue_key.clone());
+                            let option_fingerprint = export_option_fingerprint(
+                                self.include_fields.as_deref(),
+                                self.exclude_fields.as_deref(),
+                                self.no_attachments,
+                            );
+                            manifest.record_issue_with_fingerprint(
+                                &issue,
+                                artifact_path,
+                                option_fingerprint.as_deref(),
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Warning: Failed to refresh manifest metadata for {}: {}",
+                                r.issue_key, e
+                            );
+                        }
+                    }
                 }
             }
-            if let Err(e) = manifest.save(&self.output_dir) {
+            if let Err(e) = manifest.save_to_path(&manifest_path) {
                 eprintln!("Warning: Failed to save manifest: {}", e);
             }
         }
 
         let mut successes = Vec::new();
         let mut failures = Vec::new();
-        for r in results {
+        for outcome in outcomes {
+            let r = outcome.result;
             if r.success {
                 successes.push(r);
             } else {
@@ -329,11 +515,11 @@ impl BulkExporter {
     }
 }
 
-async fn backfill_changelog(
+async fn backfill_changelog_with_summary(
     client: &JiraApiClient,
     issue_key: &str,
+    summary: &str,
     output_path: &std::path::Path,
-    issue: &Issue,
     include_json: bool,
 ) {
     use crate::changelog;
@@ -352,28 +538,34 @@ async fn backfill_changelog(
         log::warn!("Backfill: failed to create {:?}: {}", output_path, e);
         return;
     }
-    match changelog::write_artifacts(issue_key, &issue.summary, &entries, output_path, include_json)
-        .await
+    match changelog::write_artifacts(issue_key, summary, &entries, output_path, include_json).await
     {
         Ok(summary) => info!(
             "Backfilled changelog for {} ({} rows)",
             issue_key, summary.entry_count
         ),
-        Err(e) => log::warn!("Backfill: failed to write changelog for {}: {}", issue_key, e),
+        Err(e) => log::warn!(
+            "Backfill: failed to write changelog for {}: {}",
+            issue_key,
+            e
+        ),
     }
 }
 
-async fn timeout_export<F>(issue_key: &str, timeout: Duration, export: F) -> ExportResult
+async fn timeout_export<F>(issue_key: &str, timeout: Duration, export: F) -> BulkTaskOutcome
 where
-    F: std::future::Future<Output = ExportResult>,
+    F: std::future::Future<Output = BulkTaskOutcome>,
 {
     match time::timeout(timeout, export).await {
         Ok(result) => result,
-        Err(_) => ExportResult {
-            issue_key: issue_key.to_string(),
-            success: false,
-            output_path: None,
-            error: Some(format!("timed out after {}s", timeout.as_secs())),
+        Err(_) => BulkTaskOutcome {
+            result: ExportResult {
+                issue_key: issue_key.to_string(),
+                success: false,
+                output_path: None,
+                error: Some(format!("timed out after {}s", timeout.as_secs())),
+            },
+            manifest_update: None,
         },
     }
 }
@@ -406,6 +598,7 @@ mod tests {
     use crate::manifest::Manifest;
     use std::io::{Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -466,32 +659,280 @@ mod tests {
             main_mtime_before, main_mtime_after,
             "main .md mtime must not change"
         );
+        assert!(
+            !server.saw_full_issue_fetch("K1"),
+            "unchanged warm incremental export must not fetch the full Issue; observed paths: {:?}",
+            server.observed_paths()
+        );
+
+        std::fs::remove_dir_all(&output_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn bulk_export_writes_external_manifest_without_moving_artifacts() {
+        let updated_ts = "2024-05-01T12:00:00.000+0000";
+        let server = BackfillServer::start(updated_ts);
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let output_dir = unique_temp_dir("jarkdown-external-manifest");
+        let manifest_path = output_dir.join("cache").join("state.json");
+
+        let exporter = BulkExporter::new(
+            client,
+            /* concurrency */ 1,
+            Some(output_dir.to_str().unwrap()),
+            None,
+            false,
+            None,
+            None,
+            false,
+            0,
+            /* incremental */ true,
+            /* force */ false,
+        )
+        .with_manifest_path(Some(manifest_path.to_str().unwrap()))
+        .with_no_attachments(true);
+
+        let (successes, failures) = exporter.export_bulk(&["K1".to_string()]).await;
+        assert_eq!(failures.len(), 0, "no failures expected");
+        assert_eq!(successes.len(), 1);
+
+        assert!(output_dir.join("K1").join("K1.md").exists());
+        assert!(!output_dir.join(".jarkdown-manifest.json").exists());
+        assert!(manifest_path.exists());
+
+        let manifest = Manifest::load_from_path(&manifest_path).expect("manifest");
+        let entry = manifest.get("K1").expect("K1 manifest entry");
+        assert_eq!(entry.summary.as_deref(), Some("Backfill me"));
+        assert_eq!(entry.issue_type.as_deref(), Some("Task"));
+        assert_eq!(entry.status.as_deref(), Some("Open"));
+        assert_eq!(entry.artifact_paths[0].path, "K1");
+
+        std::fs::remove_dir_all(&output_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn successful_validation_omission_evicts_active_issue_without_deleting_files() {
+        let updated_ts = "2024-05-01T12:00:00.000+0000";
+        let server = BackfillServer::start_with_validation(updated_ts, ValidationMode::Empty);
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let output_dir = unique_temp_dir("jarkdown-evict-missing");
+        let issue_dir = output_dir.join("K1");
+        std::fs::create_dir_all(&issue_dir).expect("mkdir issue");
+        std::fs::write(issue_dir.join("K1.md"), "KEEP").expect("seed md");
+        let mut manifest = Manifest::default();
+        manifest.record("K1", updated_ts);
+        manifest.save(&output_dir).expect("save manifest");
+
+        let exporter = BulkExporter::new(
+            client,
+            /* concurrency */ 1,
+            Some(output_dir.to_str().unwrap()),
+            None,
+            false,
+            None,
+            None,
+            false,
+            0,
+            /* incremental */ true,
+            /* force */ false,
+        )
+        .with_no_attachments(true);
+
+        let (successes, failures) = exporter.export_bulk(&["K1".to_string()]).await;
+        assert_eq!(
+            failures.len(),
+            0,
+            "eviction should not be an export failure"
+        );
+        assert_eq!(successes.len(), 1);
+        assert!(
+            issue_dir.join("K1.md").exists(),
+            "eviction must not delete files"
+        );
+        assert!(
+            !server.saw_full_issue_fetch("K1"),
+            "successful validation omission should evict without full fetch; observed paths: {:?}",
+            server.observed_paths()
+        );
+
+        let manifest = Manifest::load(&output_dir);
+        let entry = manifest.get("K1").expect("evicted entry remains");
+        assert_eq!(entry.state, crate::manifest::IssueCacheState::Evicted);
+        assert_eq!(
+            entry.eviction_reason.as_deref(),
+            Some("not_returned_by_validation_search")
+        );
+        assert!(!entry.artifact_paths[0].active);
+
+        std::fs::remove_dir_all(&output_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn failed_validation_does_not_evict_active_issue() {
+        let updated_ts = "2024-05-01T12:00:00.000+0000";
+        let server = BackfillServer::start_with_validation(updated_ts, ValidationMode::Fails);
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let output_dir = unique_temp_dir("jarkdown-validation-fails");
+        let mut manifest = Manifest::default();
+        manifest.record("K1", updated_ts);
+        manifest.save(&output_dir).expect("save manifest");
+
+        let exporter = BulkExporter::new(
+            client,
+            /* concurrency */ 1,
+            Some(output_dir.to_str().unwrap()),
+            None,
+            false,
+            None,
+            None,
+            false,
+            0,
+            /* incremental */ true,
+            /* force */ false,
+        )
+        .with_no_attachments(true);
+
+        let (_successes, failures) = exporter.export_bulk(&["K1".to_string()]).await;
+        assert_eq!(failures.len(), 0, "fallback full export should succeed");
+        assert!(
+            server.saw_full_issue_fetch("K1"),
+            "failed validation may fall back to full fetch but must not evict"
+        );
+
+        let manifest = Manifest::load(&output_dir);
+        let entry = manifest.get("K1").expect("active entry remains");
+        assert_eq!(entry.state, crate::manifest::IssueCacheState::Active);
+        assert_eq!(entry.eviction_reason, None);
+
+        std::fs::remove_dir_all(&output_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn force_incremental_reactivates_evicted_manifest_entry() {
+        let updated_ts = "2024-05-01T12:00:00.000+0000";
+        let server = BackfillServer::start_with_validation(updated_ts, ValidationMode::Empty);
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let output_dir = unique_temp_dir("jarkdown-force-reactivates");
+        let mut manifest = Manifest::default();
+        manifest.record("K1", "old");
+        manifest.evict("K1", "not_returned_by_validation_search");
+        manifest.save(&output_dir).expect("save manifest");
+
+        let exporter = BulkExporter::new(
+            client,
+            /* concurrency */ 1,
+            Some(output_dir.to_str().unwrap()),
+            None,
+            false,
+            None,
+            None,
+            false,
+            0,
+            /* incremental */ true,
+            /* force */ true,
+        )
+        .with_no_attachments(true);
+
+        let (_successes, failures) = exporter.export_bulk(&["K1".to_string()]).await;
+        assert_eq!(failures.len(), 0, "force export should succeed");
+        assert!(
+            server.saw_full_issue_fetch("K1"),
+            "force incremental should bypass validation/skip planning"
+        );
+
+        let manifest = Manifest::load(&output_dir);
+        let entry = manifest.get("K1").expect("reactivated entry");
+        assert_eq!(entry.state, crate::manifest::IssueCacheState::Active);
+        assert_eq!(entry.eviction_reason, None);
+        assert!(entry.artifact_paths[0].active);
+
+        std::fs::remove_dir_all(&output_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn force_without_incremental_does_not_write_manifest() {
+        let updated_ts = "2024-05-01T12:00:00.000+0000";
+        let server = BackfillServer::start(updated_ts);
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let output_dir = unique_temp_dir("jarkdown-force-nonincremental");
+
+        let exporter = BulkExporter::new(
+            client,
+            /* concurrency */ 1,
+            Some(output_dir.to_str().unwrap()),
+            None,
+            false,
+            None,
+            None,
+            false,
+            0,
+            /* incremental */ false,
+            /* force */ true,
+        )
+        .with_no_attachments(true);
+
+        let (_successes, failures) = exporter.export_bulk(&["K1".to_string()]).await;
+        assert_eq!(failures.len(), 0, "force export should succeed");
+        assert!(!default_manifest_path(&output_dir).exists());
 
         std::fs::remove_dir_all(&output_dir).ok();
     }
 
     struct BackfillServer {
         base_url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ValidationMode {
+        ReturnsIssue,
+        Empty,
+        Fails,
     }
 
     impl BackfillServer {
         fn start(updated_ts: &'static str) -> Self {
+            Self::start_with_validation(updated_ts, ValidationMode::ReturnsIssue)
+        }
+
+        fn start_with_validation(
+            updated_ts: &'static str,
+            validation_mode: ValidationMode,
+        ) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
             let addr = listener.local_addr().expect("addr");
             let base_url = format!("http://{}", addr);
             let ts: &'static str = updated_ts;
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let requests_for_thread = requests.clone();
 
             thread::spawn(move || {
                 for stream in listener.incoming().flatten() {
-                    handle_backfill(stream, ts);
+                    handle_backfill(stream, ts, validation_mode, &requests_for_thread);
                 }
             });
 
-            Self { base_url }
+            Self { base_url, requests }
+        }
+
+        fn observed_paths(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        fn saw_full_issue_fetch(&self, issue_key: &str) -> bool {
+            let issue_path = format!("/rest/api/3/issue/{}", issue_key);
+            self.observed_paths()
+                .iter()
+                .any(|path| path.starts_with(&issue_path) && !path.contains("/changelog"))
         }
     }
 
-    fn handle_backfill(mut stream: TcpStream, updated_ts: &str) {
+    fn handle_backfill(
+        mut stream: TcpStream,
+        updated_ts: &str,
+        validation_mode: ValidationMode,
+        requests: &Arc<Mutex<Vec<String>>>,
+    ) {
         let mut buf = [0u8; 8192];
         let n = stream.read(&mut buf).expect("read");
         let req = String::from_utf8_lossy(&buf[..n]);
@@ -501,8 +942,35 @@ mod tests {
             .and_then(|l| l.split_whitespace().nth(1))
             .unwrap_or("/")
             .to_string();
+        requests.lock().unwrap().push(path.clone());
 
-        let body = if path.starts_with("/rest/api/3/issue/K1/changelog") {
+        if path.starts_with("/rest/api/3/search/jql")
+            && matches!(validation_mode, ValidationMode::Fails)
+        {
+            let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+            let _ = stream.write_all(resp.as_bytes());
+            return;
+        }
+
+        let body = if path.starts_with("/rest/api/3/search/jql") {
+            match validation_mode {
+                ValidationMode::ReturnsIssue => format!(
+                    r#"{{
+                    "issues":[{{
+                        "key":"K1",
+                        "fields":{{
+                            "summary":"Backfill me",
+                            "updated":"{}",
+                            "issuetype":{{"name":"Task"}},
+                            "status":{{"name":"Open"}}
+                        }}
+                    }}]
+                }}"#,
+                    updated_ts
+                ),
+                ValidationMode::Empty | ValidationMode::Fails => r#"{"issues":[]}"#.to_string(),
+            }
+        } else if path.starts_with("/rest/api/3/issue/K1/changelog") {
             r#"{"startAt":0,"maxResults":100,"total":1,"isLast":true,"values":[
                 {
                     "id":"1",
@@ -563,12 +1031,13 @@ mod tests {
                 output_path: None,
                 error: None,
             }
+            .into()
         })
         .await;
 
-        assert_eq!(result.issue_key, "K1");
-        assert!(!result.success);
-        assert_eq!(result.error.as_deref(), Some("timed out after 0s"));
+        assert_eq!(result.result.issue_key, "K1");
+        assert!(!result.result.success);
+        assert_eq!(result.result.error.as_deref(), Some("timed out after 0s"));
     }
 
     #[test]

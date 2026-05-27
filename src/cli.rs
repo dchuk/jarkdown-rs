@@ -1,6 +1,6 @@
 //! CLI argument parsing using clap, matching the Python implementation exactly.
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -47,6 +47,10 @@ pub struct SharedArgs {
     #[arg(short, long)]
     pub output: Option<String>,
 
+    /// Manifest file path for incremental export state
+    #[arg(long)]
+    pub manifest: Option<String>,
+
     /// Enable verbose logging
     #[arg(short, long)]
     pub verbose: bool,
@@ -91,6 +95,10 @@ pub struct SharedArgs {
     #[arg(long)]
     pub hierarchy: bool,
 
+    /// Hierarchy output layout; requires --hierarchy
+    #[arg(long, value_enum, requires = "hierarchy")]
+    pub hierarchy_layout: Option<HierarchyLayoutArg>,
+
     /// Maximum depth to recurse into child issues (requires --hierarchy)
     #[arg(long, default_value = "2")]
     pub max_depth: u32,
@@ -103,6 +111,12 @@ pub struct SharedArgs {
     /// to a sibling `{KEY}.changelog.md` file.
     #[arg(long)]
     pub include_changelog: bool,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum HierarchyLayoutArg {
+    Corpus,
+    Nested,
 }
 
 #[derive(Parser, Debug)]
@@ -173,4 +187,104 @@ pub fn preprocess_args() -> Vec<String> {
         }
     }
     args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn manifest_flag_parses_for_export_bulk_and_query() {
+        let export = Cli::parse_from([
+            "jarkdown-rs",
+            "export",
+            "PROJ-1",
+            "--manifest",
+            "cache/state.json",
+        ]);
+        match export.command.unwrap() {
+            Command::Export(args) => {
+                assert_eq!(args.shared.manifest.as_deref(), Some("cache/state.json"))
+            }
+            _ => panic!("expected export command"),
+        }
+
+        let bulk = Cli::parse_from([
+            "jarkdown-rs",
+            "bulk",
+            "PROJ-1",
+            "--manifest",
+            "cache/state.json",
+        ]);
+        match bulk.command.unwrap() {
+            Command::Bulk(args) => {
+                assert_eq!(args.shared.manifest.as_deref(), Some("cache/state.json"))
+            }
+            _ => panic!("expected bulk command"),
+        }
+
+        let query = Cli::parse_from([
+            "jarkdown-rs",
+            "query",
+            "project = PROJ",
+            "--manifest",
+            "cache/state.json",
+        ]);
+        match query.command.unwrap() {
+            Command::Query(args) => {
+                assert_eq!(args.shared.manifest.as_deref(), Some("cache/state.json"))
+            }
+            _ => panic!("expected query command"),
+        }
+    }
+
+    #[test]
+    fn hierarchy_layout_requires_hierarchy_and_accepts_corpus_or_nested() {
+        let err = Cli::try_parse_from([
+            "jarkdown-rs",
+            "export",
+            "PROJ-1",
+            "--hierarchy-layout",
+            "corpus",
+        ])
+        .expect_err("layout without hierarchy should fail");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        let export = Cli::parse_from([
+            "jarkdown-rs",
+            "export",
+            "PROJ-1",
+            "--hierarchy",
+            "--hierarchy-layout",
+            "corpus",
+        ]);
+        match export.command.unwrap() {
+            Command::Export(args) => {
+                assert_eq!(
+                    args.shared.hierarchy_layout,
+                    Some(HierarchyLayoutArg::Corpus)
+                )
+            }
+            _ => panic!("expected export command"),
+        }
+
+        let bulk = Cli::parse_from([
+            "jarkdown-rs",
+            "bulk",
+            "PROJ-1",
+            "--hierarchy",
+            "--hierarchy-layout",
+            "nested",
+        ]);
+        match bulk.command.unwrap() {
+            Command::Bulk(args) => {
+                assert_eq!(
+                    args.shared.hierarchy_layout,
+                    Some(HierarchyLayoutArg::Nested)
+                )
+            }
+            _ => panic!("expected bulk command"),
+        }
+    }
 }

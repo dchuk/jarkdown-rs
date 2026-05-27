@@ -26,6 +26,13 @@ pub enum ExportPlan {
     Full,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlanOptions<'a> {
+    pub include_changelog: bool,
+    pub include_json: bool,
+    pub option_fingerprint: Option<&'a str>,
+}
+
 /// Decide what an incremental export should do for `issue`.
 ///
 /// `issue_dir` is the per-issue output directory — where `{KEY}.changelog.md`
@@ -36,12 +43,49 @@ pub fn plan(
     include_changelog: bool,
     issue_dir: &Path,
 ) -> ExportPlan {
-    if manifest.is_stale(&issue.key, &issue.updated) {
+    plan_metadata(
+        &issue.key,
+        &issue.updated,
+        manifest,
+        PlanOptions {
+            include_changelog,
+            include_json: false,
+            option_fingerprint: None,
+        },
+        issue_dir,
+    )
+}
+
+/// Decide what an incremental export should do from validation metadata.
+pub fn plan_metadata(
+    issue_key: &str,
+    updated: &str,
+    manifest: &Manifest,
+    options: PlanOptions<'_>,
+    issue_dir: &Path,
+) -> ExportPlan {
+    let entry = manifest.get(issue_key);
+    if manifest.is_stale(issue_key, updated) {
         return ExportPlan::Full;
     }
-    if include_changelog {
-        let changelog = issue_dir.join(format!("{}.changelog.md", issue.key));
-        if !changelog.exists() {
+    if entry.and_then(|entry| entry.option_fingerprint.as_deref()) != options.option_fingerprint {
+        return ExportPlan::Full;
+    }
+
+    let main_markdown = issue_dir.join(format!("{}.md", issue_key));
+    if !main_markdown.exists() {
+        return ExportPlan::Full;
+    }
+    if options.include_json {
+        let json = issue_dir.join(format!("{}.json", issue_key));
+        if !json.exists() {
+            return ExportPlan::Full;
+        }
+    }
+    if options.include_changelog {
+        let changelog = issue_dir.join(format!("{}.changelog.md", issue_key));
+        let changelog_json = issue_dir.join(format!("{}.changelog.json", issue_key));
+        if !changelog.exists() || (options.include_json && !changelog_json.exists()) {
             return ExportPlan::BackfillChangelogOnly;
         }
     }
@@ -77,6 +121,7 @@ mod tests {
     #[test]
     fn unchanged_with_changelog_present_is_skip() {
         let dir = temp_dir("skip");
+        std::fs::write(dir.join("K1.md"), "x").unwrap();
         std::fs::write(dir.join("K1.changelog.md"), "x").unwrap();
         let mut m = Manifest::default();
         m.record("K1", TS);
@@ -87,6 +132,7 @@ mod tests {
     #[test]
     fn unchanged_with_changelog_missing_and_flag_is_backfill() {
         let dir = temp_dir("backfill");
+        std::fs::write(dir.join("K1.md"), "x").unwrap();
         let mut m = Manifest::default();
         m.record("K1", TS);
         assert_eq!(
@@ -99,9 +145,81 @@ mod tests {
     #[test]
     fn unchanged_with_changelog_missing_but_flag_off_is_skip() {
         let dir = temp_dir("flagoff");
+        std::fs::write(dir.join("K1.md"), "x").unwrap();
         let mut m = Manifest::default();
         m.record("K1", TS);
         assert_eq!(plan(&issue("K1", TS), &m, false, &dir), ExportPlan::Skip);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_attachment_binaries_alone_are_not_freshness_inputs() {
+        let dir = temp_dir("attachments-ignored");
+        std::fs::write(dir.join("K1.md"), "x").unwrap();
+        let mut m = Manifest::default();
+        m.record("K1", TS);
+        assert_eq!(plan(&issue("K1", TS), &m, false, &dir), ExportPlan::Skip);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unchanged_with_missing_main_markdown_is_full() {
+        let dir = temp_dir("missing-main");
+        let mut m = Manifest::default();
+        m.record("K1", TS);
+        assert_eq!(plan(&issue("K1", TS), &m, false, &dir), ExportPlan::Full);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unchanged_with_missing_json_when_requested_is_full() {
+        let dir = temp_dir("missing-json");
+        std::fs::write(dir.join("K1.md"), "x").unwrap();
+        let mut m = Manifest::default();
+        m.record("K1", TS);
+        assert_eq!(
+            plan_metadata(
+                "K1",
+                TS,
+                &m,
+                PlanOptions {
+                    include_json: true,
+                    ..PlanOptions::default()
+                },
+                &dir
+            ),
+            ExportPlan::Full
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn changed_option_fingerprint_is_full() {
+        let dir = temp_dir("fingerprint");
+        std::fs::write(dir.join("K1.md"), "x").unwrap();
+        let mut m = Manifest::default();
+        m.record_metadata_with_fingerprint(
+            "K1",
+            TS,
+            Some("S"),
+            Some("Task"),
+            Some("Open"),
+            "K1",
+            Some("include_fields=a"),
+        );
+        assert_eq!(
+            plan_metadata(
+                "K1",
+                TS,
+                &m,
+                PlanOptions {
+                    option_fingerprint: Some("include_fields=b"),
+                    ..PlanOptions::default()
+                },
+                &dir
+            ),
+            ExportPlan::Full
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

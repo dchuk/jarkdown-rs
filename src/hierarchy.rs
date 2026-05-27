@@ -11,7 +11,7 @@ use std::pin::Pin;
 
 use log::{info, warn};
 
-use crate::error::Result;
+use crate::error::{JarkdownError, Result};
 use crate::exporter::IssueExporter;
 use crate::field_cache::FieldMetadataCache;
 use crate::jira_client::JiraApiClient;
@@ -22,7 +22,17 @@ pub struct IssueNode {
     pub key: String,
     pub summary: String,
     pub issue_type: String,
+    pub updated: String,
+    pub children_discovered: bool,
+    pub truncated: bool,
+    pub failures: Vec<HierarchyFailure>,
     pub children: Vec<IssueNode>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HierarchyFailure {
+    pub issue_key: String,
+    pub reason: String,
 }
 
 /// Configuration for hierarchical export.
@@ -37,6 +47,13 @@ pub struct HierarchyOptions {
     pub attachment_concurrency: usize,
     pub no_attachments: bool,
     pub include_changelog: bool,
+    pub layout: HierarchyLayout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HierarchyLayout {
+    Corpus,
+    Nested,
 }
 
 /// Orchestrates discovery and export of an issue hierarchy.
@@ -78,13 +95,24 @@ impl<'a> HierarchyExporter<'a> {
             .build_tree(root_key, output_dir, 0, epic_link_field.as_deref())
             .await?;
 
-        // Write index.md with tree visualization
+        // Write the hierarchy snapshot separately from per-Issue artifacts.
         let index_content = self.render_index(&tree, root_key);
-        let index_path = output_dir.join("index.md");
+        let index_path = match self.options.layout {
+            HierarchyLayout::Nested => output_dir.join("index.md"),
+            HierarchyLayout::Corpus => output_dir.join(format!("{}.hierarchy.md", root_key)),
+        };
         tokio::fs::write(&index_path, index_content).await?;
         info!("Wrote hierarchy index to {:?}", index_path);
 
         Ok(tree)
+    }
+
+    /// Export a hierarchy subtree without writing a root snapshot.
+    pub async fn export_subtree(&mut self, root_key: &str, output_dir: &Path) -> Result<IssueNode> {
+        tokio::fs::create_dir_all(output_dir).await?;
+        let epic_link_field = self.resolve_epic_link_field().await;
+        self.build_tree(root_key, output_dir, 0, epic_link_field.as_deref())
+            .await
     }
 
     /// Recursively build the issue tree.
@@ -111,6 +139,10 @@ impl<'a> HierarchyExporter<'a> {
                 key: issue_key.to_string(),
                 summary: "(already visited)".to_string(),
                 issue_type: String::new(),
+                updated: String::new(),
+                children_discovered: false,
+                truncated: false,
+                failures: Vec::new(),
                 children: Vec::new(),
             });
         }
@@ -118,15 +150,19 @@ impl<'a> HierarchyExporter<'a> {
         self.issue_count += 1;
 
         // Export this issue
-        let issue_dir = output_dir.join(issue_key);
+        let issue_dir = self.issue_output_dir(output_dir, issue_key);
         self.exporter.export(issue_key, &issue_dir).await?;
 
         // Fetch the issue for metadata + child discovery
         let issue = self.api_client.fetch_issue(issue_key).await?;
         let summary = issue.summary.clone();
         let issue_type = issue.issuetype.name.clone();
+        let updated = issue.updated.clone();
 
         let mut children = Vec::new();
+        let mut failures = Vec::new();
+        let mut children_discovered = false;
+        let mut truncated = false;
 
         // Stop recursing if we've hit max depth or max issues
         if depth >= self.options.max_depth || self.issue_count >= self.options.max_issues {
@@ -134,6 +170,10 @@ impl<'a> HierarchyExporter<'a> {
                 key: issue_key.to_string(),
                 summary,
                 issue_type,
+                updated,
+                children_discovered,
+                truncated: self.issue_count >= self.options.max_issues,
+                failures,
                 children,
             });
         }
@@ -167,15 +207,22 @@ impl<'a> HierarchyExporter<'a> {
         }
 
         // 3. JQL search for children (parent = KEY or "Epic Link" = KEY)
-        let jql_children = self
-            .search_children(issue_key, epic_link_field)
-            .await
-            .unwrap_or_default();
-        child_keys.extend(jql_children);
+        let child_discovery_complete = match self.search_children(issue_key, epic_link_field).await
+        {
+            Ok(jql_children) => {
+                child_keys.extend(jql_children);
+                true
+            }
+            Err(e) => {
+                warn!("Failed to discover JQL children for {}: {}", issue_key, e);
+                false
+            }
+        };
 
         // Deduplicate while preserving order
         let mut seen = HashSet::new();
         child_keys.retain(|k| seen.insert(k.clone()));
+        children_discovered = child_discovery_complete;
 
         // Recursively process children
         for child_key in &child_keys {
@@ -184,19 +231,26 @@ impl<'a> HierarchyExporter<'a> {
                     "Reached max issue limit ({}). Stopping hierarchy traversal.",
                     self.options.max_issues
                 );
+                truncated = true;
                 break;
             }
             match self
                 .build_tree(
                     child_key,
-                    &output_dir.join(issue_key),
+                    &self.child_base_dir(output_dir, issue_key),
                     depth + 1,
                     epic_link_field,
                 )
                 .await
             {
                 Ok(child_node) => children.push(child_node),
-                Err(e) => warn!("Failed to export {}: {}", child_key, e),
+                Err(e) => {
+                    warn!("Failed to export {}: {}", child_key, e);
+                    failures.push(HierarchyFailure {
+                        issue_key: child_key.clone(),
+                        reason: hierarchy_failure_reason(&e),
+                    });
+                }
             }
         }
 
@@ -204,6 +258,10 @@ impl<'a> HierarchyExporter<'a> {
             key: issue_key.to_string(),
             summary,
             issue_type,
+            updated,
+            children_discovered,
+            truncated,
+            failures,
             children,
         })
     }
@@ -237,6 +295,17 @@ impl<'a> HierarchyExporter<'a> {
             .await?;
 
         Ok(results.into_iter().map(|r| r.key).collect())
+    }
+
+    fn issue_output_dir(&self, output_dir: &Path, issue_key: &str) -> std::path::PathBuf {
+        output_dir.join(issue_key)
+    }
+
+    fn child_base_dir(&self, output_dir: &Path, issue_key: &str) -> std::path::PathBuf {
+        match self.options.layout {
+            HierarchyLayout::Nested => output_dir.join(issue_key),
+            HierarchyLayout::Corpus => output_dir.to_path_buf(),
+        }
     }
 
     /// Render the tree as a Markdown index file.
@@ -325,13 +394,25 @@ fn is_parent_link_type(link_type: &str) -> bool {
         || lower.contains("is implemented by")
 }
 
+fn hierarchy_failure_reason(error: &JarkdownError) -> String {
+    match error {
+        JarkdownError::IssueNotFound(_) => "fetch_not_found_or_forbidden".to_string(),
+        JarkdownError::JiraApi {
+            status_code: Some(403 | 404),
+            ..
+        } => "fetch_not_found_or_forbidden".to_string(),
+        _ => "child_fetch_or_export_failed".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::export::ExportWorkflowOptions;
     use crate::exporter::WorkflowIssueExporter;
     use crate::jira_client::JiraApiClient;
-    use std::collections::HashMap;
+    use crate::manifest::default_manifest_path;
+    use std::collections::{HashMap, HashSet};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
@@ -354,6 +435,7 @@ mod tests {
             attachment_concurrency: 4,
             no_attachments: true,
             include_changelog: false,
+            layout: HierarchyLayout::Nested,
         };
 
         let workflow_options = ExportWorkflowOptions {
@@ -544,17 +626,19 @@ mod tests {
     #[derive(Default)]
     struct RecordingExporter {
         calls: std::sync::Mutex<Vec<String>>,
+        dirs: std::sync::Mutex<Vec<std::path::PathBuf>>,
     }
 
     impl IssueExporter for RecordingExporter {
         fn export<'a>(
             &'a self,
             issue_key: &'a str,
-            _output_dir: &'a std::path::Path,
+            output_dir: &'a std::path::Path,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<()>> + 'a>>
         {
             Box::pin(async move {
                 self.calls.lock().unwrap().push(issue_key.to_string());
+                self.dirs.lock().unwrap().push(output_dir.to_path_buf());
                 Ok(())
             })
         }
@@ -563,6 +647,10 @@ mod tests {
     impl RecordingExporter {
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn dirs(&self) -> Vec<std::path::PathBuf> {
+            self.dirs.lock().unwrap().clone()
         }
     }
 
@@ -575,15 +663,24 @@ mod tests {
 
     impl ScriptedJiraServer {
         fn start(graph: HashMap<String, Vec<String>>) -> Self {
+            Self::start_with_not_found(graph, HashSet::new())
+        }
+
+        fn start_with_not_found(
+            graph: HashMap<String, Vec<String>>,
+            not_found: HashSet<String>,
+        ) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("test server bind");
             let addr = listener.local_addr().expect("test server addr");
             let base_url = format!("http://{}", addr);
             let graph = Arc::new(graph);
+            let not_found = Arc::new(not_found);
 
             thread::spawn(move || {
                 for stream in listener.incoming().flatten() {
                     let g = graph.clone();
-                    handle_scripted_request(stream, g);
+                    let nf = not_found.clone();
+                    handle_scripted_request(stream, g, nf);
                 }
             });
 
@@ -591,7 +688,11 @@ mod tests {
         }
     }
 
-    fn handle_scripted_request(mut stream: TcpStream, graph: Arc<HashMap<String, Vec<String>>>) {
+    fn handle_scripted_request(
+        mut stream: TcpStream,
+        graph: Arc<HashMap<String, Vec<String>>>,
+        not_found: Arc<HashSet<String>>,
+    ) {
         let mut buffer = [0; 8192];
         let bytes_read = stream.read(&mut buffer).expect("read request");
         let request = String::from_utf8_lossy(&buffer[..bytes_read]);
@@ -602,19 +703,27 @@ mod tests {
             .unwrap_or("/")
             .to_string();
 
-        let body = if let Some(key) = parse_issue_key(&path) {
-            let children = graph.get(&key).cloned().unwrap_or_default();
-            scripted_issue_response(&key, &children)
+        let (status, body) = if let Some(key) = parse_issue_key(&path) {
+            if not_found.contains(&key) {
+                (
+                    "404 Not Found",
+                    r#"{"errorMessages":["missing"]}"#.to_string(),
+                )
+            } else {
+                let children = graph.get(&key).cloned().unwrap_or_default();
+                ("200 OK", scripted_issue_response(&key, &children))
+            }
         } else if path.starts_with("/rest/api/3/field") {
-            "[]".to_string()
+            ("200 OK", "[]".to_string())
         } else if path.starts_with("/rest/api/3/search/jql") {
-            r#"{"issues":[]}"#.to_string()
+            ("200 OK", r#"{"issues":[]}"#.to_string())
         } else {
-            "{}".to_string()
+            ("200 OK", "{}".to_string())
         };
 
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status,
             body.len(),
             body
         );
@@ -697,6 +806,7 @@ mod tests {
             attachment_concurrency: 1,
             no_attachments: true,
             include_changelog: false,
+            layout: HierarchyLayout::Nested,
         }
     }
 
@@ -735,6 +845,75 @@ mod tests {
         assert_eq!(cycle_back.key, "A");
         assert_eq!(cycle_back.summary, "(already visited)");
         assert_eq!(cycle_back.issue_type, "");
+
+        std::fs::remove_dir_all(output_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn corpus_layout_exports_canonical_issue_dirs_and_root_snapshot() {
+        let mut graph = HashMap::new();
+        graph.insert("A".to_string(), vec!["B".to_string()]);
+        graph.insert("B".to_string(), vec![]);
+
+        let server = ScriptedJiraServer::start(graph);
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let output_dir = unique_temp_dir("jarkdown-corpus-layout");
+        let mut options = default_hierarchy_options(5, 10);
+        options.layout = HierarchyLayout::Corpus;
+        let fake = RecordingExporter::default();
+
+        let mut exporter = HierarchyExporter::new(&client, &fake, options);
+        let tree = exporter
+            .export_hierarchy("A", &output_dir)
+            .await
+            .expect("hierarchy export");
+
+        assert_eq!(tree.key, "A");
+        assert_eq!(fake.calls(), vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(
+            fake.dirs(),
+            vec![output_dir.join("A"), output_dir.join("B")],
+            "corpus layout should not nest child artifacts under parent dirs"
+        );
+        assert!(output_dir.join("A.hierarchy.md").exists());
+        assert!(!output_dir.join("index.md").exists());
+        assert!(
+            !default_manifest_path(&output_dir).exists(),
+            "non-incremental corpus hierarchy export must not persist a manifest"
+        );
+
+        std::fs::remove_dir_all(output_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn child_fetch_failure_records_failure_and_continues_siblings() {
+        let mut graph = HashMap::new();
+        graph.insert("A".to_string(), vec!["B".to_string(), "C".to_string()]);
+        graph.insert("C".to_string(), vec![]);
+        let not_found = HashSet::from(["B".to_string()]);
+
+        let server = ScriptedJiraServer::start_with_not_found(graph, not_found);
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let output_dir = unique_temp_dir("jarkdown-child-failure");
+        let options = default_hierarchy_options(5, 10);
+        let fake = RecordingExporter::default();
+
+        let mut exporter = HierarchyExporter::new(&client, &fake, options);
+        let tree = exporter
+            .export_hierarchy("A", &output_dir)
+            .await
+            .expect("hierarchy export should continue after child failure");
+
+        assert_eq!(tree.children.len(), 1);
+        assert_eq!(tree.children[0].key, "C");
+        assert_eq!(tree.failures.len(), 1);
+        assert_eq!(tree.failures[0].issue_key, "B");
+        assert_eq!(tree.failures[0].reason, "fetch_not_found_or_forbidden");
+        assert_eq!(
+            fake.calls(),
+            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            "the failed child is attempted and the sibling still exports"
+        );
 
         std::fs::remove_dir_all(output_dir).ok();
     }
@@ -804,7 +983,11 @@ mod tests {
             .expect("hierarchy export");
 
         let calls = fake.calls();
-        assert_eq!(calls.len(), 3, "exporter should run exactly max_issues times");
+        assert_eq!(
+            calls.len(),
+            3,
+            "exporter should run exactly max_issues times"
+        );
         assert_eq!(calls[0], "A");
         // Children are appended in discovery order; the first two siblings win.
         let exported_children: std::collections::HashSet<_> = calls[1..].iter().cloned().collect();
