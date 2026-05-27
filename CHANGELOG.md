@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.7.1 - 2026-05-27
+
+Docs-only patch release.
+
+- Rewrote the architecture guide for the 1.7 child-aware incremental cache:
+  validation-first planning, `plan_metadata`, corpus/nested hierarchy layouts,
+  shared-child traversal, child-aware warm planning, and freshness rules.
+- Expanded the manifest v2 diagnostic reference with root snapshots, timestamp
+  semantics, artifact path safety, atomic writes, and merge-on-write behavior.
+- Hardened README guidance around package vs binary names, crates.io dependency
+  usage, conservative incremental validation, and hierarchy layout defaults.
+- Removed a real-looking Jira key from internal comments. No runtime behavior
+  changes.
+
 ## 1.7.0 - 2026-05-27
 
 ### Added
