@@ -249,10 +249,7 @@ pub struct IssueSearchResult {
 }
 
 fn malformed(field: &str) -> JarkdownError {
-    JarkdownError::MalformedPayload(format!(
-        "field `{}` has an unexpected shape",
-        field
-    ))
+    JarkdownError::MalformedPayload(format!("field `{}` has an unexpected shape", field))
 }
 
 /// A string field: absent/`null` → empty, present-but-not-a-string → error.
@@ -484,14 +481,8 @@ fn parse_worklog_page(v: &Value) -> Result<WorklogPage> {
                         &e["author"]["displayName"],
                         "worklog.worklogs[].author.displayName",
                     )?,
-                    time_spent: parse_string(
-                        &e["timeSpent"],
-                        "worklog.worklogs[].timeSpent",
-                    )?,
-                    started: parse_string(
-                        &e["started"],
-                        "worklog.worklogs[].started",
-                    )?,
+                    time_spent: parse_string(&e["timeSpent"], "worklog.worklogs[].timeSpent")?,
+                    started: parse_string(&e["started"], "worklog.worklogs[].started")?,
                     time_spent_seconds: parse_u64(
                         &e["timeSpentSeconds"],
                         "worklog.worklogs[].timeSpentSeconds",
@@ -700,10 +691,7 @@ impl ChangelogEntry {
                         &item["fromString"],
                         "changelog[].items[].fromString",
                     )?,
-                    to_string: parse_opt_string(
-                        &item["toString"],
-                        "changelog[].items[].toString",
-                    )?,
+                    to_string: parse_opt_string(&item["toString"], "changelog[].items[].toString")?,
                 });
             }
             items = parsed_items;
@@ -782,7 +770,10 @@ mod tests {
             Some("Jane Smith")
         );
         // Prefer-HTML precedence: renderedFields.description wins over ADF.
-        assert_eq!(issue.description, RichText::Html("<p>Hello</p>".to_string()));
+        assert_eq!(
+            issue.description,
+            RichText::Html("<p>Hello</p>".to_string())
+        );
         assert_eq!(issue.raw, raw, "raw payload retained byte-for-byte");
     }
 
@@ -823,7 +814,10 @@ mod tests {
         .expect("parse");
         assert_eq!(issue.comments.len(), 1);
         assert_eq!(issue.comments[0].author, "Bob");
-        assert_eq!(issue.comments[0].body, RichText::Html("<p>hi</p>".to_string()));
+        assert_eq!(
+            issue.comments[0].body,
+            RichText::Html("<p>hi</p>".to_string())
+        );
     }
 
     #[test]
@@ -904,10 +898,7 @@ mod tests {
             "created": "2026-01-01T00:00:00.000+0000",
             "items": { "not": "an array" }
         }));
-        assert!(matches!(
-            bad_items,
-            Err(JarkdownError::MalformedPayload(_))
-        ));
+        assert!(matches!(bad_items, Err(JarkdownError::MalformedPayload(_))));
     }
 
     #[test]
@@ -959,7 +950,10 @@ mod tests {
         assert_eq!(issue.created, "2026-05-01T00:00:00.000+0000");
         assert_eq!(issue.duedate.as_deref(), Some("2026-06-30"));
         assert_eq!(issue.resolutiondate, None);
-        assert_eq!(issue.priority.as_ref().map(|p| p.name.as_str()), Some("High"));
+        assert_eq!(
+            issue.priority.as_ref().map(|p| p.name.as_str()),
+            Some("High")
+        );
         assert!(issue.resolution.is_none());
         assert_eq!(issue.project.name, "Proj X");
         assert_eq!(issue.project.key, "PX");
@@ -989,7 +983,10 @@ mod tests {
         assert_eq!(issue.worklog.entries.len(), 1);
         assert_eq!(issue.worklog.entries[0].author, "Alice");
         assert_eq!(issue.worklog.entries[0].time_spent, "30m");
-        assert_eq!(issue.worklog.entries[0].started, "2026-05-10T12:00:00.000+0000");
+        assert_eq!(
+            issue.worklog.entries[0].started,
+            "2026-05-10T12:00:00.000+0000"
+        );
         assert_eq!(issue.worklog.entries[0].time_spent_seconds, 1800);
         // `comment` STAYS Value — the renderer hands it to `adf_to_plain_text`.
         assert!(issue.worklog.entries[0].comment.is_object());

@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use log::{info, warn};
@@ -25,6 +25,8 @@ pub struct IssueNode {
     pub updated: String,
     pub children_discovered: bool,
     pub truncated: bool,
+    pub truncated_by_depth: bool,
+    pub truncated_by_issue_count: bool,
     pub failures: Vec<HierarchyFailure>,
     pub children: Vec<IssueNode>,
 }
@@ -88,6 +90,7 @@ impl<'a> HierarchyExporter<'a> {
         root_key: &str,
         output_dir: &Path,
     ) -> Result<IssueNode> {
+        let canonical_root_key = root_key.trim().to_ascii_uppercase();
         tokio::fs::create_dir_all(output_dir).await?;
 
         // Look up "Epic Link" field ID for this Jira instance
@@ -98,11 +101,9 @@ impl<'a> HierarchyExporter<'a> {
             .await?;
 
         // Write the hierarchy snapshot separately from per-Issue artifacts.
-        let index_content = self.render_index(&tree, root_key);
-        let index_path = match self.options.layout {
-            HierarchyLayout::Nested => output_dir.join("index.md"),
-            HierarchyLayout::Corpus => output_dir.join(format!("{}.hierarchy.md", root_key)),
-        };
+        let index_content = self.render_index(&tree, &canonical_root_key);
+        let index_path =
+            hierarchy_snapshot_path(output_dir, &canonical_root_key, self.options.layout);
         tokio::fs::write(&index_path, index_content).await?;
         info!("Wrote hierarchy index to {:?}", index_path);
 
@@ -148,6 +149,8 @@ impl<'a> HierarchyExporter<'a> {
                 updated: String::new(),
                 children_discovered: false,
                 truncated: false,
+                truncated_by_depth: false,
+                truncated_by_issue_count: false,
                 failures: Vec::new(),
                 children: Vec::new(),
             });
@@ -158,6 +161,8 @@ impl<'a> HierarchyExporter<'a> {
             return Ok(IssueNode {
                 children_discovered: false,
                 truncated: false,
+                truncated_by_depth: false,
+                truncated_by_issue_count: false,
                 failures: Vec::new(),
                 children: Vec::new(),
                 ..cached
@@ -192,7 +197,9 @@ impl<'a> HierarchyExporter<'a> {
         let mut truncated = false;
 
         // Stop recursing if we've hit max depth or max issues
-        if depth >= self.options.max_depth || self.issue_count >= self.options.max_issues {
+        let truncated_by_depth = depth >= self.options.max_depth;
+        let truncated_by_issue_count = self.issue_count >= self.options.max_issues;
+        if truncated_by_depth || truncated_by_issue_count {
             let node = IssueNode {
                 key: canonical_key.clone(),
                 summary,
@@ -200,6 +207,8 @@ impl<'a> HierarchyExporter<'a> {
                 updated,
                 children_discovered,
                 truncated: true,
+                truncated_by_depth,
+                truncated_by_issue_count,
                 failures,
                 children,
             };
@@ -292,6 +301,8 @@ impl<'a> HierarchyExporter<'a> {
             updated,
             children_discovered,
             truncated,
+            truncated_by_depth: false,
+            truncated_by_issue_count: truncated,
             failures,
             children,
         };
@@ -374,6 +385,20 @@ impl<'a> HierarchyExporter<'a> {
     }
 }
 
+pub fn hierarchy_snapshot_path(
+    output_dir: &Path,
+    root_key: &str,
+    layout: HierarchyLayout,
+) -> PathBuf {
+    let canonical_root_key = root_key.trim().to_ascii_uppercase();
+    let filename = match layout {
+        HierarchyLayout::Corpus | HierarchyLayout::Nested => {
+            format!("{}.hierarchy.md", canonical_root_key)
+        }
+    };
+    output_dir.join(filename)
+}
+
 fn render_tree_node(node: &IssueNode, prefix: &str, is_last: bool, lines: &mut Vec<String>) {
     let connector = if prefix.is_empty() {
         ""
@@ -431,12 +456,14 @@ fn is_parent_link_type(link_type: &str) -> bool {
 
 fn hierarchy_failure_reason(error: &JarkdownError) -> String {
     match error {
-        JarkdownError::IssueNotFound(_) => "fetch_not_found_or_forbidden".to_string(),
+        JarkdownError::IssueNotFound(_) => {
+            crate::manifest::EvictionReason::FETCH_NOT_FOUND_OR_FORBIDDEN.to_string()
+        }
         JarkdownError::JiraApi {
             status_code: Some(403 | 404),
             ..
-        } => "fetch_not_found_or_forbidden".to_string(),
-        _ => "child_fetch_or_export_failed".to_string(),
+        } => crate::manifest::EvictionReason::FETCH_NOT_FOUND_OR_FORBIDDEN.to_string(),
+        _ => crate::manifest::EvictionReason::CHILD_FETCH_OR_EXPORT_FAILED.to_string(),
     }
 }
 
@@ -446,7 +473,7 @@ mod tests {
     use crate::export::ExportWorkflowOptions;
     use crate::exporter::WorkflowIssueExporter;
     use crate::jira_client::JiraApiClient;
-    use crate::manifest::default_manifest_path;
+    use crate::manifest::{default_manifest_path, relative_artifact_path, Manifest};
     use std::collections::{HashMap, HashSet};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -870,7 +897,7 @@ mod tests {
 
         let mut exporter = HierarchyExporter::new(&client, &fake, options);
         let tree = exporter
-            .export_hierarchy("A", &output_dir)
+            .export_hierarchy("a", &output_dir)
             .await
             .expect("hierarchy export");
 
@@ -909,7 +936,7 @@ mod tests {
 
         let mut exporter = HierarchyExporter::new(&client, &fake, options);
         let tree = exporter
-            .export_hierarchy("A", &output_dir)
+            .export_hierarchy("a", &output_dir)
             .await
             .expect("hierarchy export");
 
@@ -926,6 +953,76 @@ mod tests {
             !default_manifest_path(&output_dir).exists(),
             "non-incremental corpus hierarchy export must not persist a manifest"
         );
+
+        std::fs::remove_dir_all(output_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn nested_layout_exports_root_keyed_snapshot() {
+        let mut graph = HashMap::new();
+        graph.insert("A".to_string(), vec![]);
+
+        let server = ScriptedJiraServer::start(graph);
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let output_dir = unique_temp_dir("jarkdown-nested-snapshot");
+        let mut options = default_hierarchy_options(5, 10);
+        options.layout = HierarchyLayout::Nested;
+        let fake = RecordingExporter::default();
+
+        let mut exporter = HierarchyExporter::new(&client, &fake, options);
+        let tree = exporter
+            .export_hierarchy("a", &output_dir)
+            .await
+            .expect("hierarchy export");
+
+        assert_eq!(tree.key, "A");
+        assert!(output_dir.join("A.hierarchy.md").exists());
+        assert!(
+            !output_dir.join("index.md").exists(),
+            "new nested root snapshots must not use the legacy shared index.md path"
+        );
+        assert_eq!(fake.dirs(), vec![output_dir.join("A")]);
+
+        std::fs::remove_dir_all(output_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn nested_multi_root_export_writes_distinct_snapshots_and_manifest_paths() {
+        let mut graph = HashMap::new();
+        graph.insert("A".to_string(), vec![]);
+        graph.insert("B".to_string(), vec![]);
+
+        let server = ScriptedJiraServer::start(graph);
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let output_dir = unique_temp_dir("jarkdown-nested-multi-root-snapshot");
+        let mut options = default_hierarchy_options(5, 10);
+        options.layout = HierarchyLayout::Nested;
+        let fake = RecordingExporter::default();
+        let mut manifest = Manifest::default();
+
+        for root in ["A", "B"] {
+            let mut exporter = HierarchyExporter::new(&client, &fake, options.clone());
+            let tree = exporter
+                .export_hierarchy(root, &output_dir)
+                .await
+                .expect("hierarchy export");
+            let snapshot_path = hierarchy_snapshot_path(&output_dir, root, HierarchyLayout::Nested);
+            manifest.record_hierarchy(
+                &tree,
+                relative_artifact_path(&output_dir, &snapshot_path),
+                HierarchyLayout::Nested,
+                None,
+            );
+        }
+
+        let a_path = &manifest.root_snapshots["A"].path;
+        let b_path = &manifest.root_snapshots["B"].path;
+        assert_ne!(a_path, b_path);
+        assert_eq!(a_path, "A.hierarchy.md");
+        assert_eq!(b_path, "B.hierarchy.md");
+        assert!(output_dir.join(a_path).exists());
+        assert!(output_dir.join(b_path).exists());
+        assert!(!output_dir.join("index.md").exists());
 
         std::fs::remove_dir_all(output_dir).ok();
     }
@@ -1049,7 +1146,7 @@ mod tests {
         let fake = RecordingExporter::default();
 
         let mut exporter = HierarchyExporter::new(&client, &fake, options);
-        let _tree = exporter
+        let tree = exporter
             .export_hierarchy("A", &output_dir)
             .await
             .expect("hierarchy export");
@@ -1059,6 +1156,10 @@ mod tests {
             vec!["A".to_string(), "B".to_string(), "C".to_string()],
             "D must not be exported once max_depth is reached"
         );
+        let depth_capped = &tree.children[0].children[0];
+        assert!(depth_capped.truncated);
+        assert!(depth_capped.truncated_by_depth);
+        assert!(!depth_capped.truncated_by_issue_count);
 
         std::fs::remove_dir_all(output_dir).ok();
     }
@@ -1090,7 +1191,7 @@ mod tests {
         let fake = RecordingExporter::default();
 
         let mut exporter = HierarchyExporter::new(&client, &fake, options);
-        let _tree = exporter
+        let tree = exporter
             .export_hierarchy("A", &output_dir)
             .await
             .expect("hierarchy export");
@@ -1108,6 +1209,9 @@ mod tests {
         assert!(exported_children.contains("C"));
         assert!(!exported_children.contains("D"));
         assert!(!exported_children.contains("E"));
+        assert!(tree.truncated);
+        assert!(!tree.truncated_by_depth);
+        assert!(tree.truncated_by_issue_count);
 
         std::fs::remove_dir_all(output_dir).ok();
     }

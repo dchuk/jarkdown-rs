@@ -13,12 +13,18 @@ use jarkdown::bulk::BulkExporter;
 use jarkdown::cli::{self, Cli, Command};
 use jarkdown::export::{perform_export_with_options, ExportWorkflowOptions};
 use jarkdown::freshness::{self, ExportPlan, PlanOptions};
-use jarkdown::hierarchy::{HierarchyExporter, HierarchyLayout, HierarchyOptions};
+use jarkdown::hierarchy::{
+    hierarchy_snapshot_path, HierarchyExporter, HierarchyLayout, HierarchyOptions,
+};
 use jarkdown::issue::IssueSearchResult;
 use jarkdown::jira_client::{JiraApiClient, ValidationIssue};
 use jarkdown::manifest::{
-    default_manifest_path, export_option_fingerprint, relative_artifact_path,
-    sanitize_artifact_path, ExportFingerprintOptions, Manifest,
+    default_manifest_path, export_option_fingerprint, normalize_issue_key, relative_artifact_path,
+    sanitize_artifact_path, EvictionReason, ExportFingerprintOptions, Manifest,
+};
+use jarkdown::planner::{
+    hierarchy_validation_keys, plan_warm_corpus_hierarchy, plan_warm_nested_hierarchy,
+    HierarchyValidationKeysInput, WarmHierarchyPlan, WarmHierarchyPlanInput,
 };
 
 /// Load and validate Jira credentials from environment variables.
@@ -225,15 +231,16 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
         return;
     }
 
+    let issue_key = normalize_issue_key(&args.issue_key);
     let output_path = args
         .shared
         .output
         .as_ref()
-        .map(|o| PathBuf::from(o).join(&args.issue_key))
+        .map(|o| PathBuf::from(o).join(&issue_key))
         .unwrap_or_else(|| {
             std::env::current_dir()
                 .unwrap_or_else(|_| PathBuf::from("."))
-                .join(&args.issue_key)
+                .join(&issue_key)
         });
     let output_root = output_path.parent().unwrap_or(std::path::Path::new("."));
     let manifest_path = manifest_path_for_output(output_root, &args.shared);
@@ -243,7 +250,10 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
     );
     let mut manifest = if args.shared.incremental {
         match Manifest::load_from_path(&manifest_path) {
-            Ok(manifest) => Some(manifest),
+            Ok(manifest) => {
+                manifest.warn_legacy_issue_directories(output_root);
+                Some(manifest)
+            }
             Err(e) => {
                 eprintln!("Error: {}", e);
                 process::exit(1);
@@ -256,14 +266,14 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
     // Incremental check for single export
     if args.shared.incremental && !args.shared.force {
         let (validation_succeeded, validation) = match client
-            .validate_issue_keys(std::slice::from_ref(&args.issue_key))
+            .validate_issue_keys(std::slice::from_ref(&issue_key))
             .await
         {
             Ok(results) => (
                 true,
                 results
                     .into_iter()
-                    .map(|issue| (issue.key.clone(), issue))
+                    .map(|issue| (normalize_issue_key(&issue.key), issue))
                     .collect::<HashMap<_, _>>(),
             ),
             Err(e) => {
@@ -275,10 +285,9 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
             }
         };
 
-        let normalized_issue_key = args.issue_key.trim().to_ascii_uppercase();
-        if let Some(issue) = validation.get(&normalized_issue_key) {
+        if let Some(issue) = validation.get(&issue_key) {
             match freshness::plan_metadata(
-                &args.issue_key,
+                &issue_key,
                 &issue.updated,
                 manifest.as_ref().expect("manifest loaded for incremental"),
                 PlanOptions {
@@ -291,7 +300,7 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
                 &output_path,
             ) {
                 ExportPlan::Skip => {
-                    info!("Skipping {} (unchanged since last export)", args.issue_key);
+                    info!("Skipping {} (unchanged since last export)", issue_key);
                     if let Some(manifest) = manifest.as_mut() {
                         manifest.record_metadata_with_fingerprint(
                             &issue.key,
@@ -309,11 +318,8 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
                     return;
                 }
                 ExportPlan::BackfillChangelogOnly => {
-                    info!(
-                        "Backfilling changelog for {} (issue unchanged)",
-                        args.issue_key
-                    );
-                    match client.fetch_changelog(&args.issue_key).await {
+                    info!("Backfilling changelog for {} (issue unchanged)", issue_key);
+                    match client.fetch_changelog(&issue_key).await {
                         Ok(entries) => {
                             let summary = issue
                                 .summary
@@ -326,7 +332,7 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
                                 })
                                 .unwrap_or(&issue.key);
                             if let Err(e) = jarkdown::changelog::write_artifacts(
-                                &args.issue_key,
+                                &issue_key,
                                 summary,
                                 &entries,
                                 &output_path,
@@ -362,14 +368,11 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
         } else if validation_succeeded
             && manifest
                 .as_ref()
-                .is_some_and(|manifest| manifest.is_active(&args.issue_key))
+                .is_some_and(|manifest| manifest.is_active(&issue_key))
         {
-            info!(
-                "Evicting {} (not returned by validation search)",
-                args.issue_key
-            );
+            info!("Evicting {} (not returned by validation search)", issue_key);
             if let Some(manifest) = manifest.as_mut() {
-                manifest.evict(&args.issue_key, "not_returned_by_validation_search");
+                manifest.evict(&issue_key, EvictionReason::NotReturnedByValidationSearch);
                 if let Err(e) = manifest.save_to_path(&manifest_path) {
                     eprintln!("Warning: Failed to save manifest: {}", e);
                 }
@@ -380,7 +383,7 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
 
     let export = perform_export_with_options(
         &client,
-        &args.issue_key,
+        &issue_key,
         &output_path,
         ExportWorkflowOptions {
             refresh_fields: args.shared.refresh_fields,
@@ -402,14 +405,14 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
         Err(_) => {
             eprintln!(
                 "Error: {} timed out after {}s",
-                args.issue_key, args.shared.issue_timeout_seconds
+                issue_key, args.shared.issue_timeout_seconds
             );
             process::exit(1);
         }
         Ok(Ok(path)) => {
             // Update manifest for incremental support
             if args.shared.incremental {
-                if let Ok(issue) = client.fetch_issue(&args.issue_key).await {
+                if let Ok(issue) = client.fetch_issue(&issue_key).await {
                     if let Some(manifest) = manifest.as_mut() {
                         manifest.record_issue_with_fingerprint(
                             &issue,
@@ -423,16 +426,16 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
                 }
             }
 
-            info!("\nSuccessfully exported {} to {:?}", args.issue_key, path);
+            info!("\nSuccessfully exported {} to {:?}", issue_key, path);
             if args.shared.include_json {
                 info!(
                     "  - Raw JSON: {:?}",
-                    path.join(format!("{}.json", args.issue_key))
+                    path.join(format!("{}.json", issue_key))
                 );
             }
             info!(
                 "  - Markdown file: {:?}",
-                path.join(format!("{}.md", args.issue_key))
+                path.join(format!("{}.md", issue_key))
             );
         }
         Ok(Err(e)) => {
@@ -642,6 +645,7 @@ async fn run_hierarchy_export_with_validation(
     shared: &jarkdown::cli::SharedArgs,
     validation_plan: Option<&HashMap<String, ValidationIssue>>,
 ) -> jarkdown::ExportResult {
+    let issue_key = normalize_issue_key(issue_key);
     let options = HierarchyOptions {
         max_depth: shared.max_depth,
         max_issues: shared.max_issues,
@@ -664,7 +668,7 @@ async fn run_hierarchy_export_with_validation(
             HierarchyLayout::Corpus => {
                 try_warm_corpus_hierarchy_skip(
                     client,
-                    issue_key,
+                    &issue_key,
                     output_dir,
                     shared,
                     &manifest_path,
@@ -677,7 +681,7 @@ async fn run_hierarchy_export_with_validation(
             HierarchyLayout::Nested => {
                 try_warm_nested_hierarchy_skip(
                     client,
-                    issue_key,
+                    &issue_key,
                     output_dir,
                     shared,
                     &manifest_path,
@@ -696,7 +700,7 @@ async fn run_hierarchy_export_with_validation(
                     count_nodes(&tree)
                 );
                 return jarkdown::ExportResult {
-                    issue_key: issue_key.to_string(),
+                    issue_key: issue_key.clone(),
                     success: true,
                     output_path: Some(output_dir.join(issue_key)),
                     error: None,
@@ -721,13 +725,13 @@ async fn run_hierarchy_export_with_validation(
         options: workflow_options,
     };
     let mut exporter = HierarchyExporter::new(client, &workflow_exporter, options.clone());
-    let export = exporter.export_hierarchy(issue_key, output_dir);
+    let export = exporter.export_hierarchy(&issue_key, output_dir);
     match time::timeout(Duration::from_secs(shared.issue_timeout_seconds), export).await {
         Err(_) => {
             let error = format!("timed out after {}s", shared.issue_timeout_seconds);
             eprintln!("Error exporting hierarchy for {}: {}", issue_key, error);
             jarkdown::ExportResult {
-                issue_key: issue_key.to_string(),
+                issue_key: issue_key.clone(),
                 success: false,
                 output_path: None,
                 error: Some(error),
@@ -737,12 +741,9 @@ async fn run_hierarchy_export_with_validation(
             if shared.incremental {
                 match Manifest::load_from_path(&manifest_path) {
                     Ok(mut manifest) => {
-                        let snapshot_path = match options.layout {
-                            HierarchyLayout::Corpus => {
-                                output_dir.join(format!("{}.hierarchy.md", issue_key))
-                            }
-                            HierarchyLayout::Nested => output_dir.join("index.md"),
-                        };
+                        manifest.warn_legacy_issue_directories(output_dir);
+                        let snapshot_path =
+                            hierarchy_snapshot_path(output_dir, &issue_key, options.layout);
                         manifest.record_hierarchy(
                             &tree,
                             relative_artifact_path(output_dir, &snapshot_path),
@@ -762,7 +763,7 @@ async fn run_hierarchy_export_with_validation(
                 count_nodes(&tree)
             );
             jarkdown::ExportResult {
-                issue_key: issue_key.to_string(),
+                issue_key: issue_key.clone(),
                 success: true,
                 output_path: Some(output_dir.join(issue_key)),
                 error: None,
@@ -771,7 +772,7 @@ async fn run_hierarchy_export_with_validation(
         Ok(Err(e)) => {
             eprintln!("Error exporting hierarchy for {}: {}", issue_key, e);
             jarkdown::ExportResult {
-                issue_key: issue_key.to_string(),
+                issue_key,
                 success: false,
                 output_path: None,
                 error: Some(e.to_string()),
@@ -791,9 +792,7 @@ async fn try_warm_corpus_hierarchy_skip(
     validation_plan: Option<&HashMap<String, ValidationIssue>>,
 ) -> jarkdown::Result<Option<jarkdown::IssueNode>> {
     let mut manifest = Manifest::load_from_path(manifest_path)?;
-    let Some(tree) = manifest.cached_hierarchy_tree(issue_key) else {
-        return Ok(None);
-    };
+    manifest.warn_legacy_issue_directories(output_dir);
     let keys = manifest.active_hierarchy_keys(issue_key);
     if keys.is_empty() {
         return Ok(None);
@@ -805,60 +804,42 @@ async fn try_warm_corpus_hierarchy_skip(
             .validate_issue_keys(&keys)
             .await?
             .into_iter()
-            .map(|issue| (normalize_issue_key_local(&issue.key), issue))
+            .map(|issue| (normalize_issue_key(&issue.key), issue))
             .collect::<HashMap<_, _>>(),
     };
-    let missing_keys: Vec<String> = keys
-        .iter()
-        .filter(|key| !validation.contains_key(*key))
-        .cloned()
-        .collect();
+    let plan = plan_warm_corpus_hierarchy(WarmHierarchyPlanInput {
+        root_key: issue_key,
+        output_dir,
+        manifest: &manifest,
+        validation: &validation,
+        options: PlanOptions {
+            include_changelog: shared.include_changelog,
+            include_json: shared.include_json,
+            option_fingerprint,
+            option_fingerprint_without_changelog,
+        },
+    });
+    let (missing_keys, keys, refresh_plans) = match plan {
+        WarmHierarchyPlan::FullExport => return Ok(None),
+        WarmHierarchyPlan::UseCached {
+            missing_keys,
+            validated_keys,
+        } => (missing_keys, validated_keys, Vec::new()),
+        WarmHierarchyPlan::RefreshDescendants {
+            missing_keys,
+            validated_keys,
+            refresh_plans,
+        } => (missing_keys, validated_keys, refresh_plans),
+    };
     for key in &missing_keys {
-        manifest.evict(key, "not_returned_by_validation_search");
-    }
-    let keys: Vec<String> = keys
-        .into_iter()
-        .filter(|key| validation.contains_key(key))
-        .collect();
-    if keys.is_empty() {
-        manifest.save_to_path(manifest_path)?;
-        return Ok(manifest.cached_hierarchy_tree(issue_key));
-    }
-
-    let mut refresh_plans = Vec::new();
-    for key in &keys {
-        let Some(issue) = validation.get(key) else {
-            return Ok(None);
-        };
-        let plan = freshness::plan_metadata(
-            key,
-            &issue.updated,
-            &manifest,
-            PlanOptions {
-                include_changelog: shared.include_changelog,
-                include_json: shared.include_json,
-                option_fingerprint,
-                option_fingerprint_without_changelog,
-            },
-            &output_dir.join(key),
-        );
-        match plan {
-            ExportPlan::Skip => {}
-            ExportPlan::Full
-                if normalize_issue_key_local(key) != normalize_issue_key_local(issue_key) =>
-            {
-                refresh_plans.push((key.clone(), ExportPlan::Full));
-            }
-            ExportPlan::BackfillChangelogOnly
-                if normalize_issue_key_local(key) != normalize_issue_key_local(issue_key) =>
-            {
-                refresh_plans.push((key.clone(), ExportPlan::BackfillChangelogOnly));
-            }
-            ExportPlan::Full | ExportPlan::BackfillChangelogOnly => return Ok(None),
-        }
+        manifest.evict(key, EvictionReason::NotReturnedByValidationSearch);
     }
 
     if !refresh_plans.is_empty() {
+        let refresh_plans = refresh_plans
+            .iter()
+            .map(|plan| (plan.key.clone(), plan.plan))
+            .collect::<Vec<_>>();
         refresh_changed_corpus_descendants(
             client,
             issue_key,
@@ -887,7 +868,7 @@ async fn try_warm_corpus_hierarchy_skip(
         );
     }
     manifest.save_to_path(manifest_path)?;
-    Ok(Some(tree))
+    Ok(manifest.cached_hierarchy_tree(issue_key))
 }
 
 async fn refresh_changed_corpus_descendants(
@@ -916,10 +897,10 @@ async fn refresh_changed_corpus_descendants(
 
     let refresh_set: std::collections::HashSet<_> = refresh_plans
         .iter()
-        .map(|(key, _)| normalize_issue_key_local(key))
+        .map(|(key, _)| normalize_issue_key(key))
         .collect();
     for (key, plan) in refresh_plans {
-        let normalized_key = normalize_issue_key_local(key);
+        let normalized_key = normalize_issue_key(key);
         if refresh_set.iter().any(|other| {
             other != &normalized_key && manifest.is_descendant_of(other, &normalized_key)
         }) {
@@ -1007,9 +988,7 @@ async fn try_warm_nested_hierarchy_skip(
     validation_plan: Option<&HashMap<String, ValidationIssue>>,
 ) -> jarkdown::Result<Option<jarkdown::IssueNode>> {
     let mut manifest = Manifest::load_from_path(manifest_path)?;
-    let Some(tree) = manifest.cached_hierarchy_tree(issue_key) else {
-        return Ok(None);
-    };
+    manifest.warn_legacy_issue_directories(output_dir);
     let keys = manifest.active_hierarchy_keys(issue_key);
     if keys.is_empty() {
         return Ok(None);
@@ -1021,80 +1000,39 @@ async fn try_warm_nested_hierarchy_skip(
             .validate_issue_keys(&keys)
             .await?
             .into_iter()
-            .map(|issue| (normalize_issue_key_local(&issue.key), issue))
+            .map(|issue| (normalize_issue_key(&issue.key), issue))
             .collect::<HashMap<_, _>>(),
     };
-    let missing_keys: Vec<String> = keys
-        .iter()
-        .filter(|key| !validation.contains_key(*key))
-        .cloned()
-        .collect();
+    let plan = plan_warm_nested_hierarchy(WarmHierarchyPlanInput {
+        root_key: issue_key,
+        output_dir,
+        manifest: &manifest,
+        validation: &validation,
+        options: PlanOptions {
+            include_changelog: shared.include_changelog,
+            include_json: shared.include_json,
+            option_fingerprint,
+            option_fingerprint_without_changelog,
+        },
+    });
+    let (missing_keys, refresh_plans) = match plan {
+        WarmHierarchyPlan::FullExport => return Ok(None),
+        WarmHierarchyPlan::UseCached { missing_keys, .. } => (missing_keys, Vec::new()),
+        WarmHierarchyPlan::RefreshDescendants {
+            missing_keys,
+            refresh_plans,
+            ..
+        } => (missing_keys, refresh_plans),
+    };
     for key in &missing_keys {
-        manifest.evict(key, "not_returned_by_validation_search");
-    }
-    let keys: Vec<String> = keys
-        .into_iter()
-        .filter(|key| validation.contains_key(key))
-        .collect();
-    if keys.is_empty() {
-        manifest.save_to_path(manifest_path)?;
-        return Ok(manifest.cached_hierarchy_tree(issue_key));
-    }
-
-    let mut refresh_plans = Vec::new();
-    for key in &keys {
-        let Some(issue) = validation.get(key) else {
-            return Ok(None);
-        };
-        let paths = manifest.active_artifact_paths(key);
-        if paths.is_empty() {
-            return Ok(None);
-        }
-        let needs_refresh = paths.iter().any(|path| {
-            let Some(path) = artifact_output_path(output_dir, path) else {
-                return true;
-            };
-            freshness::plan_metadata(
-                key,
-                &issue.updated,
-                &manifest,
-                PlanOptions {
-                    include_changelog: shared.include_changelog,
-                    include_json: shared.include_json,
-                    option_fingerprint,
-                    option_fingerprint_without_changelog,
-                },
-                &path,
-            ) != ExportPlan::Skip
-        });
-        if needs_refresh {
-            if normalize_issue_key_local(key) == normalize_issue_key_local(issue_key) {
-                return Ok(None);
-            }
-            let plan = paths
-                .iter()
-                .filter_map(|path| artifact_output_path(output_dir, path))
-                .map(|path| {
-                    freshness::plan_metadata(
-                        key,
-                        &issue.updated,
-                        &manifest,
-                        PlanOptions {
-                            include_changelog: shared.include_changelog,
-                            include_json: shared.include_json,
-                            option_fingerprint,
-                            option_fingerprint_without_changelog,
-                        },
-                        &path,
-                    )
-                })
-                .find(|plan| *plan == ExportPlan::Full)
-                .unwrap_or(ExportPlan::BackfillChangelogOnly);
-            refresh_plans.push((key.clone(), plan));
-        }
+        manifest.evict(key, EvictionReason::NotReturnedByValidationSearch);
     }
 
     if !refresh_plans.is_empty() {
+        let refresh_plans = refresh_plans
+            .iter()
+            .map(|plan| (plan.key.clone(), plan.plan))
+            .collect::<Vec<_>>();
         refresh_changed_nested_descendants(
             client,
             issue_key,
@@ -1111,7 +1049,7 @@ async fn try_warm_nested_hierarchy_skip(
     }
 
     manifest.save_to_path(manifest_path)?;
-    Ok(Some(tree))
+    Ok(manifest.cached_hierarchy_tree(issue_key))
 }
 
 async fn refresh_changed_nested_descendants(
@@ -1140,10 +1078,10 @@ async fn refresh_changed_nested_descendants(
 
     let refresh_set: std::collections::HashSet<_> = refresh_plans
         .iter()
-        .map(|(key, _)| normalize_issue_key_local(key))
+        .map(|(key, _)| normalize_issue_key(key))
         .collect();
     for (key, plan) in refresh_plans {
-        let normalized_key = normalize_issue_key_local(key);
+        let normalized_key = normalize_issue_key(key);
         if refresh_set.iter().any(|other| {
             other != &normalized_key && manifest.is_descendant_of(other, &normalized_key)
         }) {
@@ -1246,14 +1184,14 @@ fn nested_refresh_base(
     artifact_path: &str,
     issue_key: &str,
 ) -> PathBuf {
-    let normalized_key = normalize_issue_key_local(issue_key);
+    let normalized_key = normalize_issue_key(issue_key);
     let mut parts: Vec<&str> = artifact_path
         .split('/')
         .filter(|part| !part.is_empty())
         .collect();
     if parts
         .last()
-        .is_some_and(|last| normalize_issue_key_local(last) == normalized_key)
+        .is_some_and(|last| normalize_issue_key(last) == normalized_key)
     {
         parts.pop();
     }
@@ -1308,7 +1246,10 @@ async fn build_hierarchy_validation_plan(
     }
     let manifest_path = manifest_path_for_output(output_dir, shared);
     let manifest = match Manifest::load_from_path(&manifest_path) {
-        Ok(manifest) => manifest,
+        Ok(manifest) => {
+            manifest.warn_legacy_issue_directories(output_dir);
+            manifest
+        }
         Err(e) => {
             eprintln!(
                 "Warning: Failed to load hierarchy manifest for validation: {}",
@@ -1317,13 +1258,10 @@ async fn build_hierarchy_validation_plan(
             return None;
         }
     };
-    let mut keys = Vec::new();
-    for root in requested_roots {
-        push_normalized_unique(&mut keys, root);
-        for key in manifest.active_hierarchy_keys(root) {
-            push_normalized_unique(&mut keys, &key);
-        }
-    }
+    let keys = hierarchy_validation_keys(HierarchyValidationKeysInput {
+        requested_roots,
+        manifest: &manifest,
+    });
     if keys.is_empty() {
         return None;
     }
@@ -1331,7 +1269,7 @@ async fn build_hierarchy_validation_plan(
         Ok(results) => Some(
             results
                 .into_iter()
-                .map(|issue| (normalize_issue_key_local(&issue.key), issue))
+                .map(|issue| (normalize_issue_key(&issue.key), issue))
                 .collect(),
         ),
         Err(e) => {
@@ -1342,17 +1280,6 @@ async fn build_hierarchy_validation_plan(
             None
         }
     }
-}
-
-fn push_normalized_unique(keys: &mut Vec<String>, key: &str) {
-    let key = normalize_issue_key_local(key);
-    if !keys.contains(&key) {
-        keys.push(key);
-    }
-}
-
-fn normalize_issue_key_local(key: &str) -> String {
-    key.trim().to_ascii_uppercase()
 }
 
 fn hierarchy_layout(shared: &jarkdown::cli::SharedArgs) -> HierarchyLayout {
@@ -1491,6 +1418,8 @@ mod tests {
             updated: "2026-01-01T00:00:00.000+0000".to_string(),
             children_discovered: true,
             truncated: false,
+            truncated_by_depth: false,
+            truncated_by_issue_count: false,
             failures: Vec::new(),
             children: vec![jarkdown::IssueNode {
                 key: "B".to_string(),
@@ -1499,6 +1428,8 @@ mod tests {
                 updated: "2026-01-01T00:00:00.000+0000".to_string(),
                 children_discovered: true,
                 truncated: false,
+                truncated_by_depth: false,
+                truncated_by_issue_count: false,
                 failures: Vec::new(),
                 children: Vec::new(),
             }],
@@ -1572,6 +1503,8 @@ mod tests {
             updated: "2026-01-01T00:00:00.000+0000".to_string(),
             children_discovered: true,
             truncated: false,
+            truncated_by_depth: false,
+            truncated_by_issue_count: false,
             failures: Vec::new(),
             children: vec![
                 jarkdown::IssueNode {
@@ -1581,6 +1514,8 @@ mod tests {
                     updated: "2026-01-01T00:00:00.000+0000".to_string(),
                     children_discovered: true,
                     truncated: false,
+                    truncated_by_depth: false,
+                    truncated_by_issue_count: false,
                     failures: Vec::new(),
                     children: Vec::new(),
                 },
@@ -1591,6 +1526,8 @@ mod tests {
                     updated: "2026-01-01T00:00:00.000+0000".to_string(),
                     children_discovered: true,
                     truncated: false,
+                    truncated_by_depth: false,
+                    truncated_by_issue_count: false,
                     failures: Vec::new(),
                     children: Vec::new(),
                 },
@@ -1631,8 +1568,8 @@ mod tests {
         let c = manifest.get("C").unwrap();
         assert_eq!(c.state, jarkdown::manifest::IssueCacheState::Evicted);
         assert_eq!(
-            c.eviction_reason.as_deref(),
-            Some("not_returned_by_validation_search")
+            c.eviction_reason,
+            Some(EvictionReason::NotReturnedByValidationSearch)
         );
         assert!(c.artifact_paths.iter().all(|path| !path.active));
         assert!(output_dir.join("C").join("C.md").exists());
@@ -1667,6 +1604,8 @@ mod tests {
                 updated: OLD_TS.to_string(),
                 children_discovered: true,
                 truncated: false,
+                truncated_by_depth: false,
+                truncated_by_issue_count: false,
                 failures: Vec::new(),
                 children: vec![jarkdown::IssueNode {
                     key: "B".to_string(),
@@ -1675,6 +1614,8 @@ mod tests {
                     updated: OLD_TS.to_string(),
                     children_discovered: true,
                     truncated: false,
+                    truncated_by_depth: false,
+                    truncated_by_issue_count: false,
                     failures: Vec::new(),
                     children: Vec::new(),
                 }],
@@ -1725,6 +1666,8 @@ mod tests {
                 updated: OLD_TS.to_string(),
                 children_discovered: true,
                 truncated: false,
+                truncated_by_depth: false,
+                truncated_by_issue_count: false,
                 failures: Vec::new(),
                 children: vec![jarkdown::IssueNode {
                     key: "B".to_string(),
@@ -1733,6 +1676,8 @@ mod tests {
                     updated: OLD_TS.to_string(),
                     children_discovered: true,
                     truncated: false,
+                    truncated_by_depth: false,
+                    truncated_by_issue_count: false,
                     failures: Vec::new(),
                     children: Vec::new(),
                 }],
@@ -1784,6 +1729,8 @@ mod tests {
                 updated: OLD_TS.to_string(),
                 children_discovered: true,
                 truncated: false,
+                truncated_by_depth: false,
+                truncated_by_issue_count: false,
                 failures: Vec::new(),
                 children: vec![jarkdown::IssueNode {
                     key: "B".to_string(),
@@ -1792,6 +1739,8 @@ mod tests {
                     updated: OLD_TS.to_string(),
                     children_discovered: true,
                     truncated: false,
+                    truncated_by_depth: false,
+                    truncated_by_issue_count: false,
                     failures: Vec::new(),
                     children: vec![jarkdown::IssueNode {
                         key: "C".to_string(),
@@ -1800,6 +1749,8 @@ mod tests {
                         updated: OLD_TS.to_string(),
                         children_discovered: true,
                         truncated: false,
+                        truncated_by_depth: false,
+                        truncated_by_issue_count: false,
                         failures: Vec::new(),
                         children: Vec::new(),
                     }],
@@ -1863,6 +1814,8 @@ mod tests {
                 updated: OLD_TS.to_string(),
                 children_discovered: true,
                 truncated: false,
+                truncated_by_depth: false,
+                truncated_by_issue_count: false,
                 failures: Vec::new(),
                 children: vec![jarkdown::IssueNode {
                     key: "C".to_string(),
@@ -1871,6 +1824,8 @@ mod tests {
                     updated: OLD_TS.to_string(),
                     children_discovered: true,
                     truncated: false,
+                    truncated_by_depth: false,
+                    truncated_by_issue_count: false,
                     failures: Vec::new(),
                     children: Vec::new(),
                 }],
@@ -1887,6 +1842,8 @@ mod tests {
                 updated: OLD_TS.to_string(),
                 children_discovered: true,
                 truncated: false,
+                truncated_by_depth: false,
+                truncated_by_issue_count: false,
                 failures: Vec::new(),
                 children: vec![jarkdown::IssueNode {
                     key: "C".to_string(),
@@ -1895,6 +1852,8 @@ mod tests {
                     updated: OLD_TS.to_string(),
                     children_discovered: true,
                     truncated: false,
+                    truncated_by_depth: false,
+                    truncated_by_issue_count: false,
                     failures: Vec::new(),
                     children: Vec::new(),
                 }],
@@ -1973,6 +1932,8 @@ mod tests {
                 updated: OLD_TS.to_string(),
                 children_discovered: true,
                 truncated: false,
+                truncated_by_depth: false,
+                truncated_by_issue_count: false,
                 failures: Vec::new(),
                 children: vec![jarkdown::IssueNode {
                     key: "C".to_string(),
@@ -1981,6 +1942,8 @@ mod tests {
                     updated: OLD_TS.to_string(),
                     children_discovered: true,
                     truncated: false,
+                    truncated_by_depth: false,
+                    truncated_by_issue_count: false,
                     failures: Vec::new(),
                     children: Vec::new(),
                 }],
@@ -1997,6 +1960,8 @@ mod tests {
                 updated: OLD_TS.to_string(),
                 children_discovered: true,
                 truncated: false,
+                truncated_by_depth: false,
+                truncated_by_issue_count: false,
                 failures: Vec::new(),
                 children: vec![jarkdown::IssueNode {
                     key: "C".to_string(),
@@ -2005,6 +1970,8 @@ mod tests {
                     updated: OLD_TS.to_string(),
                     children_discovered: true,
                     truncated: false,
+                    truncated_by_depth: false,
+                    truncated_by_issue_count: false,
                     failures: Vec::new(),
                     children: Vec::new(),
                 }],
@@ -2070,6 +2037,8 @@ mod tests {
                 updated: OLD_TS.to_string(),
                 children_discovered: true,
                 truncated: false,
+                truncated_by_depth: false,
+                truncated_by_issue_count: false,
                 failures: Vec::new(),
                 children: vec![jarkdown::IssueNode {
                     key: "C".to_string(),
@@ -2078,6 +2047,8 @@ mod tests {
                     updated: OLD_TS.to_string(),
                     children_discovered: true,
                     truncated: false,
+                    truncated_by_depth: false,
+                    truncated_by_issue_count: false,
                     failures: Vec::new(),
                     children: Vec::new(),
                 }],
@@ -2094,6 +2065,8 @@ mod tests {
                 updated: OLD_TS.to_string(),
                 children_discovered: true,
                 truncated: false,
+                truncated_by_depth: false,
+                truncated_by_issue_count: false,
                 failures: Vec::new(),
                 children: Vec::new(),
             },

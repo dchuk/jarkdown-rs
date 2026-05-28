@@ -106,7 +106,8 @@ pub async fn write_artifacts(
 }
 
 fn yaml_scalar(s: &str) -> String {
-    if s.contains(':') || s.contains('#') || s.contains('"') || s.contains('\'') || s.contains('\n') {
+    if s.contains(':') || s.contains('#') || s.contains('"') || s.contains('\'') || s.contains('\n')
+    {
         let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
         format!("\"{}\"", escaped)
     } else {
@@ -324,8 +325,9 @@ mod tests {
             "expected 2 rows from a 2-item entry; got:\n{}",
             output
         );
-        assert!(lines[0]
-            .contains("2024-02-01T09:00:00Z — Bob Jones — **status**: To Do → In Progress"));
+        assert!(
+            lines[0].contains("2024-02-01T09:00:00Z — Bob Jones — **status**: To Do → In Progress")
+        );
         assert!(lines[1].contains("2024-02-01T09:00:00Z — Bob Jones — **assignee**:"));
     }
 
@@ -354,7 +356,8 @@ mod tests {
             render_changelog_file("PROJ-123", "Implement auth", &entries, fixed_generated_at());
 
         assert!(
-            output.contains("- 2024-01-20T14:32:17Z — Jane Smith — **status**: To Do → In Progress"),
+            output
+                .contains("- 2024-01-20T14:32:17Z — Jane Smith — **status**: To Do → In Progress"),
             "missing expected bullet line; got:\n{}",
             output
         );

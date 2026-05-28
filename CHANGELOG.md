@@ -1,5 +1,52 @@
 # Changelog
 
+## 1.7.2 - 2026-05-27
+
+Cache-correctness patch release.
+
+### Added
+
+- Typed `EvictionReason` vocabulary
+  (`not_returned_by_validation_search`, `fetch_not_found_or_forbidden`,
+  `child_fetch_or_export_failed`, `force_fetch_failed`) with stable
+  serialization and round-trip support for unknown legacy strings.
+- `truncated_by_depth` / `truncated_by_issue_count` cause flags on root
+  snapshots, in addition to the existing compatibility `truncated` boolean.
+- New internal `planner` module with deterministic warm-hierarchy planning
+  for corpus and nested layouts, covered by direct unit tests.
+- Validation pagination guard that errors after a bounded number of pages
+  per chunk so a misbehaving Jira response cannot loop forever.
+
+### Changed
+
+- Requested Issue keys are canonicalized to uppercase before writing
+  artifacts, so `proj-1` and `PROJ-1` both land in the same `PROJ-1/`
+  directory and manifest entry.
+- Nested hierarchy root snapshots now write to `{ROOT}.hierarchy.md` (same
+  as corpus), so multiple Requested Roots in one output directory do not
+  collide on a shared `index.md`.
+- Hierarchy edge upserts replace duplicate legacy edges with a single
+  active edge and only mark touched parents for merge-on-write.
+- `--force --incremental` failures on a previously evicted entry now
+  preserve the eviction with a `force_fetch_failed` reason instead of
+  reviving the entry.
+
+### Fixed
+
+- Manifest loads warn when they find legacy case-mismatched Issue
+  directories (e.g. `proj-1/` for canonical key `PROJ-1`) or legacy
+  nested `index.md` snapshots, without renaming or deleting either.
+- Validation pagination correctly terminates on empty `nextPageToken`
+  and when all requested keys in a chunk have already been seen.
+
+### Documentation
+
+- Refreshed `docs/architecture.md` and `docs/manifest-v2.md` for the
+  new eviction vocabulary, truncation cause metadata, canonical Issue
+  directories, planner extraction, and nested snapshot disambiguation.
+- README updates for canonical Issue directory normalization and the
+  new nested `{ROOT}.hierarchy.md` snapshot path.
+
 ## 1.7.1 - 2026-05-27
 
 Docs-only patch release.

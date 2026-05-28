@@ -35,7 +35,7 @@ flowchart TB
         EXPORT["<code>export::perform_export_with_options</code><br/>single Issue workflow"]
         BULK["<code>bulk::BulkExporter</code><br/>concurrent flat export"]
         HIER["<code>hierarchy::HierarchyExporter</code><br/>recursive traversal"]
-        PLANNER["main.rs hierarchy warm planner<br/>validation, skip, refresh"]
+        PLANNER["<code>planner</code><br/>hierarchy warm planner<br/>validation, skip, refresh"]
         EXSEAM["<code>exporter::IssueExporter</code><br/>test seam"]
     end
 
@@ -119,6 +119,10 @@ Layer rules to preserve:
   timestamp/artifact/fingerprint rules inline.
 - Manifest v2 is the source of cache truth for incremental state, hierarchy
   edges, requested roots, artifact paths, evictions, and root snapshots.
+- Eviction reasons are typed in code and serialized as stable manifest strings:
+  `not_returned_by_validation_search`, `fetch_not_found_or_forbidden`,
+  `child_fetch_or_export_failed`, and `force_fetch_failed`. Unknown legacy
+  strings load and round-trip unchanged for compatibility.
 
 ## Single-Issue Export Flow
 
@@ -231,9 +235,15 @@ delegates each Issue artifact write to `perform_export_with_options`, while
 tests can substitute a fake exporter. Layout determines where artifacts are
 written:
 
-- `corpus`: one canonical directory per Issue under the output root, plus a
+- `corpus`: one canonical uppercase directory per Issue under the output root,
+  plus a `{ROOT}.hierarchy.md` snapshot.
+- `nested`: tree-shaped directories for browsing, plus a
   `{ROOT}.hierarchy.md` snapshot.
-- `nested`: tree-shaped directories for browsing, plus `index.md`.
+
+All export entry points normalize requested Issue keys before building
+per-Issue output directories. Manifest loads scan actual directory entry names
+under the output root and warn about legacy case-mismatched Issue directories
+without renaming them.
 
 `--incremental --hierarchy` defaults to `corpus` because it best matches
 shared-cache semantics. Non-incremental hierarchy export keeps the legacy nested
@@ -251,14 +261,14 @@ flowchart TB
     discover["discover children:<br/>subtasks, parent links,<br/>JPD delivery links, Epic Link JQL"]
     recurse["recurse children"]
     node["IssueNode"]
-    snapshot["render root snapshot/index"]
+    snapshot["render root snapshot"]
 
     start --> build --> stack
     stack -->|yes cycle| node
     stack -->|no| emitted
     emitted -->|yes shared child| export --> node
     emitted -->|no| export --> fetch --> cap
-    cap -->|yes truncated| node
+    cap -->|yes truncated with cause| node
     cap -->|no| discover --> recurse --> node
     node --> snapshot
 ```
@@ -266,13 +276,20 @@ flowchart TB
 The traversal distinguishes recursion-stack cycle prevention from non-cyclic
 shared-child revisits. A shared child can be written at multiple nested paths and
 recorded under multiple parent edges without duplicating child discovery.
+Nested root snapshots are named `{ROOT}.hierarchy.md`, matching corpus snapshot
+naming so multi-root exports do not collide. Legacy nested manifests that still
+reference `index.md` are warned about at load and remain readable without
+automatic migration or deletion.
 
 ## Child-Aware Incremental Hierarchy
 
-Warm hierarchy planning validates the current Requested Root plus its active
-cached descendants. Successful validation omissions evict only the omitted
-active keys and continue planning the remaining validated descendants. Failed
-validation requests evict nothing.
+Warm hierarchy planning is split between pure decisions in `src/planner.rs` and
+side-effect orchestration in `src/main.rs`. The planner takes the current
+Requested Roots, loaded manifest state, validation metadata, freshness options,
+and artifact paths, then returns deterministic validation keys or warm-cache
+work plans. Successful validation omissions evict only the omitted active keys
+and continue planning the remaining validated descendants. Failed validation
+requests evict nothing.
 
 ```mermaid
 flowchart TB
@@ -307,6 +324,11 @@ Issue to every active artifact path recorded for it.
 
 Root snapshots are traversal snapshots, not live views. Descendant-only refresh
 does not rebuild unchanged ancestor snapshots.
+The manifest keeps the existing `truncated` root snapshot boolean for
+compatibility and adds `truncated_by_depth` and
+`truncated_by_issue_count` booleans to distinguish which traversal bound stopped
+the snapshot. Missing cause fields in older manifests default to `false` rather
+than guessing from `truncated`.
 
 ## Freshness Decision
 
@@ -421,7 +443,7 @@ flowchart LR
 | Single-export workflow | `src/export.rs` |
 | Flat bulk/query orchestration | `src/bulk.rs`, `src/main.rs` |
 | Hierarchy traversal | `src/hierarchy.rs`, `src/exporter.rs` |
-| Hierarchy warm planning | `src/main.rs` |
+| Hierarchy warm planning | `src/planner.rs`, `src/main.rs` |
 | HTTP transport | `src/jira_client.rs`, `src/retry.rs` |
 | Typed Issue model | `src/issue.rs` |
 | Incremental decision | `src/freshness.rs`, `src/manifest.rs` |

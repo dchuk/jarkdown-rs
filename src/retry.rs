@@ -1,9 +1,9 @@
 //! Retry and rate-limiting utilities for async API calls.
 
-use std::time::Duration;
 use chrono::Utc;
 use log::warn;
 use rand::Rng;
+use std::time::Duration;
 
 /// Configuration for retry behavior with exponential backoff.
 #[derive(Debug, Clone)]
@@ -57,9 +57,9 @@ where
         match f().await {
             Ok(val) => return Ok(val),
             Err(e) => {
-                let is_retryable = e.status().is_some_and(|s| {
-                    config.retryable_status_codes.contains(&s.as_u16())
-                });
+                let is_retryable = e
+                    .status()
+                    .is_some_and(|s| config.retryable_status_codes.contains(&s.as_u16()));
                 if !is_retryable || attempt == config.max_retries {
                     last_err = Some(e);
                     break;
@@ -71,7 +71,9 @@ where
                 }
                 warn!(
                     "Rate limited (attempt {}/{}), retrying in {:.1}s...",
-                    attempt + 1, config.max_retries, delay
+                    attempt + 1,
+                    config.max_retries,
+                    delay
                 );
                 tokio::time::sleep(Duration::from_secs_f64(delay)).await;
                 last_err = Some(e);

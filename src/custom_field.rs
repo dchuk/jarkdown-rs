@@ -108,7 +108,11 @@ where
                 // ADF document
                 if obj.get("type").and_then(|t| t.as_str()) == Some("doc") {
                     let rendered = (self.adf_parser)(value);
-                    return if rendered.is_empty() { None } else { Some(rendered) };
+                    return if rendered.is_empty() {
+                        None
+                    } else {
+                        Some(rendered)
+                    };
                 }
                 // Option/select
                 if let Some(v) = obj.get("value").and_then(|v| v.as_str()) {

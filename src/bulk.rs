@@ -20,7 +20,7 @@ use crate::freshness::{self, ExportPlan, PlanOptions};
 use crate::jira_client::{JiraApiClient, ValidationIssue};
 use crate::manifest::{
     default_manifest_path, export_option_fingerprint, normalize_issue_key, relative_artifact_path,
-    ExportFingerprintOptions, Manifest,
+    EvictionReason, ExportFingerprintOptions, IssueCacheState, Manifest,
 };
 
 /// Result of a single issue export attempt.
@@ -39,7 +39,10 @@ struct BulkTaskOutcome {
 
 enum ManifestUpdate {
     Validated(ManifestValidationUpdate),
-    Evicted { issue_key: String, reason: String },
+    Evicted {
+        issue_key: String,
+        reason: EvictionReason,
+    },
 }
 
 struct ManifestValidationUpdate {
@@ -153,7 +156,10 @@ impl BulkExporter {
             .unwrap_or_else(|| default_manifest_path(&self.output_dir));
         let manifest = if self.incremental {
             match Manifest::load_from_path(&manifest_path) {
-                Ok(manifest) => Some(manifest),
+                Ok(manifest) => {
+                    manifest.warn_legacy_issue_directories(&self.output_dir);
+                    Some(manifest)
+                }
                 Err(e) => {
                     let failures = issue_keys
                         .iter()
@@ -204,7 +210,7 @@ impl BulkExporter {
                 let att_concurrency = self.attachment_concurrency;
                 let no_attachments = self.no_attachments;
                 let issue_timeout = self.issue_timeout;
-                let key = key.clone();
+                let key = normalize_issue_key(key);
                 let manifest_ref = manifest.clone();
                 let force = self.force;
                 let include_changelog = self.include_changelog;
@@ -226,7 +232,6 @@ impl BulkExporter {
                         ..ExportFingerprintOptions::default()
                     });
                 let validation = validation.clone();
-                let validation_succeeded = validation_succeeded;
 
                 async move {
                     let _permit = sem.acquire().await.unwrap();
@@ -243,15 +248,15 @@ impl BulkExporter {
                             if !force {
                                 let normalized_key = normalize_issue_key(&key);
                                 if let Some(validated) = validation.get(&normalized_key) {
-                                    let path = output_dir.join(&key);
+                                    let path = output_dir.join(&normalized_key);
                                     let unchanged = ExportResult {
-                                        issue_key: key.clone(),
+                                        issue_key: normalized_key.clone(),
                                         success: true,
                                         output_path: Some(path.clone()),
                                         error: None,
                                     };
                                     match freshness::plan_metadata(
-                                        &key,
+                                        &normalized_key,
                                         &validated.updated,
                                         m,
                                         PlanOptions {
@@ -288,12 +293,16 @@ impl BulkExporter {
                                                 .summary
                                                 .as_deref()
                                                 .or_else(|| {
-                                                    m.get(&key)
+                                                    m.get(&normalized_key)
                                                         .and_then(|entry| entry.summary.as_deref())
                                                 })
                                                 .unwrap_or(&validated.key);
                                             backfill_changelog_with_summary(
-                                                &client, &key, summary, &path, json,
+                                                &client,
+                                                &normalized_key,
+                                                summary,
+                                                &path,
+                                                json,
                                             )
                                             .await;
                                             return BulkTaskOutcome {
@@ -313,24 +322,29 @@ impl BulkExporter {
                                         }
                                         ExportPlan::Full => {}
                                     }
-                                } else if validation_succeeded && m.is_active(&key) {
+                                } else if validation_succeeded && m.is_active(&normalized_key) {
                                     info!("Evicting {} (not returned by validation search)", key);
                                     return BulkTaskOutcome {
                                         result: ExportResult {
-                                            issue_key: key.clone(),
+                                            issue_key: normalized_key.clone(),
                                             success: true,
-                                            output_path: Some(output_dir.join(&key)),
+                                            output_path: Some(output_dir.join(&normalized_key)),
                                             error: None,
                                         },
                                         manifest_update: Some(ManifestUpdate::Evicted {
-                                            issue_key: key,
-                                            reason: "not_returned_by_validation_search".to_string(),
+                                            issue_key: normalized_key,
+                                            reason: EvictionReason::NotReturnedByValidationSearch,
                                         }),
                                     };
                                 }
                             }
                         }
 
+                        let forced_evicted_entry = force
+                            && manifest_ref.as_ref().is_some_and(|m| {
+                                m.get(&key)
+                                    .is_some_and(|entry| entry.state == IssueCacheState::Evicted)
+                            });
                         let output_path = output_dir.join(&key);
                         match perform_export_with_options(
                             &client,
@@ -353,15 +367,32 @@ impl BulkExporter {
                                 success: true,
                                 output_path: Some(path),
                                 error: None,
+                            }
+                            .into(),
+                            Err(e) if forced_evicted_entry => BulkTaskOutcome {
+                                result: ExportResult {
+                                    issue_key: key.clone(),
+                                    success: false,
+                                    output_path: None,
+                                    error: Some(format!(
+                                        "{}: {}",
+                                        EvictionReason::FORCE_FETCH_FAILED,
+                                        e
+                                    )),
+                                },
+                                manifest_update: Some(ManifestUpdate::Evicted {
+                                    issue_key: key,
+                                    reason: EvictionReason::ForceFetchFailed,
+                                }),
                             },
                             Err(e) => ExportResult {
                                 issue_key: key,
                                 success: false,
                                 output_path: None,
                                 error: Some(e.to_string()),
-                            },
+                            }
+                            .into(),
                         }
-                        .into()
                     };
 
                     let result = timeout_export(&key_for_timeout, issue_timeout, export).await;
@@ -398,7 +429,7 @@ impl BulkExporter {
                             );
                         }
                         ManifestUpdate::Evicted { issue_key, reason } => {
-                            manifest.evict(issue_key, reason);
+                            manifest.evict(issue_key, reason.clone());
                         }
                     }
                     continue;
@@ -732,6 +763,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bulk_export_canonicalizes_lowercase_requested_issue_directory_and_manifest_path() {
+        let updated_ts = "2024-05-01T12:00:00.000+0000";
+        let server = BackfillServer::start(updated_ts);
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let output_dir = unique_temp_dir("jarkdown-canonical-dir");
+
+        let exporter = BulkExporter::new(
+            client,
+            /* concurrency */ 1,
+            Some(output_dir.to_str().unwrap()),
+            None,
+            false,
+            None,
+            None,
+            false,
+            0,
+            /* incremental */ true,
+            /* force */ false,
+        )
+        .with_no_attachments(true);
+
+        let (successes, failures) = exporter.export_bulk(&["k1".to_string()]).await;
+        assert_eq!(failures.len(), 0, "no failures expected");
+        assert_eq!(successes.len(), 1);
+        assert_eq!(successes[0].issue_key, "K1");
+        let expected_output_path = output_dir.join("K1");
+        assert_eq!(
+            successes[0].output_path.as_ref(),
+            Some(&expected_output_path)
+        );
+
+        let dir_names: Vec<String> = std::fs::read_dir(&output_dir)
+            .expect("read output dir")
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|ty| ty.is_dir()))
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            dir_names.iter().any(|name| name == "K1"),
+            "expected byte-for-byte K1 directory entry, got {:?}",
+            dir_names
+        );
+        assert!(
+            !dir_names.iter().any(|name| name == "k1"),
+            "lowercase issue directory should not be created; got {:?}",
+            dir_names
+        );
+        assert!(output_dir.join("K1").join("K1.md").exists());
+
+        let manifest = Manifest::load(&output_dir);
+        let entry = manifest.get("K1").expect("K1 manifest entry");
+        assert_eq!(entry.artifact_paths[0].path, "K1");
+        assert!(output_dir
+            .join(&entry.artifact_paths[0].path)
+            .join("K1.md")
+            .exists());
+
+        std::fs::remove_dir_all(&output_dir).ok();
+    }
+
+    #[tokio::test]
     async fn successful_validation_omission_evicts_active_issue_without_deleting_files() {
         let updated_ts = "2024-05-01T12:00:00.000+0000";
         let server = BackfillServer::start_with_validation(updated_ts, ValidationMode::Empty);
@@ -780,8 +872,8 @@ mod tests {
         let entry = manifest.get("K1").expect("evicted entry remains");
         assert_eq!(entry.state, crate::manifest::IssueCacheState::Evicted);
         assert_eq!(
-            entry.eviction_reason.as_deref(),
-            Some("not_returned_by_validation_search")
+            entry.eviction_reason,
+            Some(EvictionReason::NotReturnedByValidationSearch)
         );
         assert!(!entry.artifact_paths[0].active);
 
@@ -836,7 +928,7 @@ mod tests {
         let output_dir = unique_temp_dir("jarkdown-force-reactivates");
         let mut manifest = Manifest::default();
         manifest.record("K1", "old");
-        manifest.evict("K1", "not_returned_by_validation_search");
+        manifest.evict("K1", EvictionReason::NotReturnedByValidationSearch);
         manifest.save(&output_dir).expect("save manifest");
 
         let exporter = BulkExporter::new(
@@ -866,6 +958,68 @@ mod tests {
         assert_eq!(entry.state, crate::manifest::IssueCacheState::Active);
         assert_eq!(entry.eviction_reason, None);
         assert!(entry.artifact_paths[0].active);
+
+        std::fs::remove_dir_all(&output_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn force_incremental_failed_fetch_keeps_evicted_entry_with_force_reason() {
+        let updated_ts = "2024-05-01T12:00:00.000+0000";
+        let server =
+            BackfillServer::start_with_validation(updated_ts, ValidationMode::FullIssueFails);
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let output_dir = unique_temp_dir("jarkdown-force-fetch-failed");
+        let mut manifest = Manifest::default();
+        manifest.record("K1", "old");
+        manifest.evict("K1", EvictionReason::NotReturnedByValidationSearch);
+        manifest.save(&output_dir).expect("save manifest");
+
+        let exporter = BulkExporter::new(
+            client,
+            /* concurrency */ 1,
+            Some(output_dir.to_str().unwrap()),
+            None,
+            false,
+            None,
+            None,
+            false,
+            0,
+            /* incremental */ true,
+            /* force */ true,
+        )
+        .with_no_attachments(true);
+
+        let (successes, failures) = exporter.export_bulk(&["K1".to_string()]).await;
+        assert_eq!(successes.len(), 0, "force fetch should fail");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].issue_key, "K1");
+        assert!(
+            failures[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains(EvictionReason::FORCE_FETCH_FAILED)),
+            "failure summary should include force_fetch_failed: {:?}",
+            failures[0].error
+        );
+        assert!(
+            server.saw_full_issue_fetch("K1"),
+            "force incremental should attempt a full Issue fetch"
+        );
+        let summary = exporter.generate_index_md(&failures, &HashMap::new());
+        assert!(
+            summary.contains(EvictionReason::FORCE_FETCH_FAILED),
+            "generated summary should include force_fetch_failed: {}",
+            summary
+        );
+
+        let manifest = Manifest::load(&output_dir);
+        let entry = manifest.get("K1").expect("evicted entry remains");
+        assert_eq!(entry.state, IssueCacheState::Evicted);
+        assert_eq!(
+            entry.eviction_reason,
+            Some(EvictionReason::ForceFetchFailed)
+        );
+        assert!(!entry.artifact_paths[0].active);
 
         std::fs::remove_dir_all(&output_dir).ok();
     }
@@ -909,6 +1063,7 @@ mod tests {
         ReturnsIssue,
         Empty,
         Fails,
+        FullIssueFails,
     }
 
     impl BackfillServer {
@@ -973,6 +1128,20 @@ mod tests {
             return;
         }
 
+        if path.starts_with("/rest/api/3/issue/K1")
+            && !path.contains("/changelog")
+            && matches!(validation_mode, ValidationMode::FullIssueFails)
+        {
+            let body = r#"{"errorMessages":["missing"]}"#;
+            let resp = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            return;
+        }
+
         let body = if path.starts_with("/rest/api/3/search/jql") {
             match validation_mode {
                 ValidationMode::ReturnsIssue => format!(
@@ -989,7 +1158,9 @@ mod tests {
                 }}"#,
                     updated_ts
                 ),
-                ValidationMode::Empty | ValidationMode::Fails => r#"{"issues":[]}"#.to_string(),
+                ValidationMode::Empty | ValidationMode::Fails | ValidationMode::FullIssueFails => {
+                    r#"{"issues":[]}"#.to_string()
+                }
             }
         } else if path.starts_with("/rest/api/3/issue/K1/changelog") {
             r#"{"startAt":0,"maxResults":100,"total":1,"isLast":true,"values":[
