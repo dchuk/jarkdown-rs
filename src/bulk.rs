@@ -232,7 +232,6 @@ impl BulkExporter {
                         ..ExportFingerprintOptions::default()
                     });
                 let validation = validation.clone();
-                let validation_succeeded = validation_succeeded;
 
                 async move {
                     let _permit = sem.acquire().await.unwrap();

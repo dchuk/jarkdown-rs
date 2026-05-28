@@ -793,9 +793,6 @@ async fn try_warm_corpus_hierarchy_skip(
 ) -> jarkdown::Result<Option<jarkdown::IssueNode>> {
     let mut manifest = Manifest::load_from_path(manifest_path)?;
     manifest.warn_legacy_issue_directories(output_dir);
-    let Some(_tree) = manifest.cached_hierarchy_tree(issue_key) else {
-        return Ok(None);
-    };
     let keys = manifest.active_hierarchy_keys(issue_key);
     if keys.is_empty() {
         return Ok(None);
@@ -807,7 +804,7 @@ async fn try_warm_corpus_hierarchy_skip(
             .validate_issue_keys(&keys)
             .await?
             .into_iter()
-            .map(|issue| (normalize_issue_key_local(&issue.key), issue))
+            .map(|issue| (normalize_issue_key(&issue.key), issue))
             .collect::<HashMap<_, _>>(),
     };
     let plan = plan_warm_corpus_hierarchy(WarmHierarchyPlanInput {
@@ -900,10 +897,10 @@ async fn refresh_changed_corpus_descendants(
 
     let refresh_set: std::collections::HashSet<_> = refresh_plans
         .iter()
-        .map(|(key, _)| normalize_issue_key_local(key))
+        .map(|(key, _)| normalize_issue_key(key))
         .collect();
     for (key, plan) in refresh_plans {
-        let normalized_key = normalize_issue_key_local(key);
+        let normalized_key = normalize_issue_key(key);
         if refresh_set.iter().any(|other| {
             other != &normalized_key && manifest.is_descendant_of(other, &normalized_key)
         }) {
@@ -992,9 +989,6 @@ async fn try_warm_nested_hierarchy_skip(
 ) -> jarkdown::Result<Option<jarkdown::IssueNode>> {
     let mut manifest = Manifest::load_from_path(manifest_path)?;
     manifest.warn_legacy_issue_directories(output_dir);
-    let Some(_tree) = manifest.cached_hierarchy_tree(issue_key) else {
-        return Ok(None);
-    };
     let keys = manifest.active_hierarchy_keys(issue_key);
     if keys.is_empty() {
         return Ok(None);
@@ -1006,7 +1000,7 @@ async fn try_warm_nested_hierarchy_skip(
             .validate_issue_keys(&keys)
             .await?
             .into_iter()
-            .map(|issue| (normalize_issue_key_local(&issue.key), issue))
+            .map(|issue| (normalize_issue_key(&issue.key), issue))
             .collect::<HashMap<_, _>>(),
     };
     let plan = plan_warm_nested_hierarchy(WarmHierarchyPlanInput {
@@ -1084,10 +1078,10 @@ async fn refresh_changed_nested_descendants(
 
     let refresh_set: std::collections::HashSet<_> = refresh_plans
         .iter()
-        .map(|(key, _)| normalize_issue_key_local(key))
+        .map(|(key, _)| normalize_issue_key(key))
         .collect();
     for (key, plan) in refresh_plans {
-        let normalized_key = normalize_issue_key_local(key);
+        let normalized_key = normalize_issue_key(key);
         if refresh_set.iter().any(|other| {
             other != &normalized_key && manifest.is_descendant_of(other, &normalized_key)
         }) {
@@ -1190,14 +1184,14 @@ fn nested_refresh_base(
     artifact_path: &str,
     issue_key: &str,
 ) -> PathBuf {
-    let normalized_key = normalize_issue_key_local(issue_key);
+    let normalized_key = normalize_issue_key(issue_key);
     let mut parts: Vec<&str> = artifact_path
         .split('/')
         .filter(|part| !part.is_empty())
         .collect();
     if parts
         .last()
-        .is_some_and(|last| normalize_issue_key_local(last) == normalized_key)
+        .is_some_and(|last| normalize_issue_key(last) == normalized_key)
     {
         parts.pop();
     }
@@ -1275,7 +1269,7 @@ async fn build_hierarchy_validation_plan(
         Ok(results) => Some(
             results
                 .into_iter()
-                .map(|issue| (normalize_issue_key_local(&issue.key), issue))
+                .map(|issue| (normalize_issue_key(&issue.key), issue))
                 .collect(),
         ),
         Err(e) => {
@@ -1286,10 +1280,6 @@ async fn build_hierarchy_validation_plan(
             None
         }
     }
-}
-
-fn normalize_issue_key_local(key: &str) -> String {
-    key.trim().to_ascii_uppercase()
 }
 
 fn hierarchy_layout(shared: &jarkdown::cli::SharedArgs) -> HierarchyLayout {
