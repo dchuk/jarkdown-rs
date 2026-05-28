@@ -119,13 +119,11 @@ impl FieldMetadataCache {
             // Populate the map so we can iterate it
             self.get_field_name("");
         }
-        self.field_map
-            .as_ref()
-            .and_then(|map| {
-                map.iter()
-                    .find(|(_, v)| v.as_str() == name)
-                    .map(|(k, _)| k.clone())
-            })
+        self.field_map.as_ref().and_then(|map| {
+            map.iter()
+                .find(|(_, v)| v.as_str() == name)
+                .map(|(k, _)| k.clone())
+        })
     }
 
     /// Get the schema for a field by ID.

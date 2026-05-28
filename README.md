@@ -212,6 +212,9 @@ With `--include-json` set as well, the changelog also lands in a parallel
 
 ### Bulk / Query Export
 
+Requested Issue keys are normalized before writing artifacts, so `proj-1` and
+`PROJ-1` both write to the canonical `PROJ-1/` directory.
+
 ```
 output/
 ├── index.md
@@ -231,6 +234,8 @@ output/
 `<output>/.jarkdown-manifest.json` by default. Use `--manifest <path>` when
 the cache state should live somewhere else. Artifact paths inside the manifest
 remain relative to the export output root, not to the manifest file.
+When loading a manifest, jarkdown warns if it sees an older case-mismatched
+Issue directory such as `proj-1/`; it leaves legacy directories in place.
 
 Manifest v2 tracks validated Jira `updated` timestamps, content-visible option
 fingerprints, evicted Issue tombstones, hierarchy graph edges, requested roots,
@@ -268,7 +273,7 @@ Use `--hierarchy-layout nested` when you want the older browsable tree layout:
 
 ```
 output/
-├── index.md
+├── EPIC-123.hierarchy.md
 └── EPIC-123/
     ├── EPIC-123.md
     └── STORY-1/
@@ -277,6 +282,8 @@ output/
 
 Nested incremental exports record every active path for shared Issues, so a
 changed shared Issue can be refreshed everywhere it appears.
+Older nested exports wrote a shared `index.md` root snapshot; jarkdown warns
+when a manifest still references that legacy snapshot and leaves it in place.
 
 ## Markdown Format
 
@@ -456,9 +463,10 @@ jarkdown-rs export IDEA-42
 
 In `--hierarchy` mode, jarkdown-rs follows the full chain: Idea → Epics →
 Stories/Tasks → Subtasks. Non-incremental hierarchy exports default to the
-legacy nested tree with an `index.md`; incremental hierarchy exports default to
-the corpus layout for better shared-cache behavior. Use `--hierarchy-layout
-nested` or `--hierarchy-layout corpus` to choose explicitly.
+legacy nested tree; nested and corpus layouts both write root snapshots as
+`{ROOT}.hierarchy.md`. Incremental hierarchy exports default to the corpus
+layout for better shared-cache behavior. Use `--hierarchy-layout nested` or
+`--hierarchy-layout corpus` to choose explicitly.
 
 ## Requirements
 

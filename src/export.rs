@@ -388,8 +388,16 @@ mod tests {
         let body = tokio::fs::read_to_string(issue_dir.join("K1.changelog.md"))
             .await
             .expect("read changelog");
-        assert!(body.contains("entries: 0"), "expected entries: 0; got:\n{}", body);
-        assert!(body.contains("# K1 Changelog"), "expected heading; got:\n{}", body);
+        assert!(
+            body.contains("entries: 0"),
+            "expected entries: 0; got:\n{}",
+            body
+        );
+        assert!(
+            body.contains("# K1 Changelog"),
+            "expected heading; got:\n{}",
+            body
+        );
         let bullet_lines = body.lines().filter(|l| l.starts_with("- ")).count();
         assert_eq!(bullet_lines, 0, "expected no bullets; got:\n{}", body);
 
@@ -478,8 +486,16 @@ mod tests {
             .await
             .expect("read changelog file");
 
-        assert!(body.starts_with("---\n"), "missing YAML frontmatter:\n{}", body);
-        assert!(body.contains("key: K1"), "missing key in frontmatter:\n{}", body);
+        assert!(
+            body.starts_with("---\n"),
+            "missing YAML frontmatter:\n{}",
+            body
+        );
+        assert!(
+            body.contains("key: K1"),
+            "missing key in frontmatter:\n{}",
+            body
+        );
         assert!(
             body.contains("summary: Implement auth"),
             "missing summary in frontmatter:\n{}",

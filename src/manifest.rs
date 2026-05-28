@@ -31,6 +31,20 @@ pub struct ArtifactPath {
     pub active: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyIssueDirectoryWarning {
+    pub issue_key: String,
+    pub path: PathBuf,
+    pub found_name: String,
+    pub expected_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyNestedSnapshotWarning {
+    pub root_key: String,
+    pub path: String,
+}
+
 /// Active/evicted state for an Issue cache record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -38,6 +52,58 @@ pub enum IssueCacheState {
     Active,
     OrphanedHierarchyMember,
     Evicted,
+}
+
+/// Stable coarse reasons for Evicted Issue tombstones in manifest v2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvictionReason {
+    NotReturnedByValidationSearch,
+    FetchNotFoundOrForbidden,
+    ChildFetchOrExportFailed,
+    ForceFetchFailed,
+    Unknown(String),
+}
+
+impl EvictionReason {
+    pub const NOT_RETURNED_BY_VALIDATION_SEARCH: &'static str = "not_returned_by_validation_search";
+    pub const FETCH_NOT_FOUND_OR_FORBIDDEN: &'static str = "fetch_not_found_or_forbidden";
+    pub const CHILD_FETCH_OR_EXPORT_FAILED: &'static str = "child_fetch_or_export_failed";
+    pub const FORCE_FETCH_FAILED: &'static str = "force_fetch_failed";
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::NotReturnedByValidationSearch => Self::NOT_RETURNED_BY_VALIDATION_SEARCH,
+            Self::FetchNotFoundOrForbidden => Self::FETCH_NOT_FOUND_OR_FORBIDDEN,
+            Self::ChildFetchOrExportFailed => Self::CHILD_FETCH_OR_EXPORT_FAILED,
+            Self::ForceFetchFailed => Self::FORCE_FETCH_FAILED,
+            Self::Unknown(reason) => reason,
+        }
+    }
+}
+
+impl Serialize for EvictionReason {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for EvictionReason {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let reason = String::deserialize(deserializer)?;
+        Ok(match reason.as_str() {
+            Self::NOT_RETURNED_BY_VALIDATION_SEARCH => Self::NotReturnedByValidationSearch,
+            Self::FETCH_NOT_FOUND_OR_FORBIDDEN => Self::FetchNotFoundOrForbidden,
+            Self::CHILD_FETCH_OR_EXPORT_FAILED => Self::ChildFetchOrExportFailed,
+            Self::FORCE_FETCH_FAILED => Self::ForceFetchFailed,
+            _ => Self::Unknown(reason),
+        })
+    }
 }
 
 /// Per-issue metadata stored in the manifest.
@@ -60,7 +126,7 @@ pub struct ManifestEntry {
     pub state: IssueCacheState,
     /// Coarse eviction reason when `state` is `evicted`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub eviction_reason: Option<String>,
+    pub eviction_reason: Option<EvictionReason>,
     /// Artifact directories or files for this Issue, relative to the output root.
     #[serde(default)]
     pub artifact_paths: Vec<ArtifactPath>,
@@ -110,6 +176,10 @@ pub struct RootSnapshot {
     #[serde(default)]
     pub truncated: bool,
     #[serde(default)]
+    pub truncated_by_depth: bool,
+    #[serde(default)]
+    pub truncated_by_issue_count: bool,
+    #[serde(default)]
     pub failures: Vec<HierarchyFailureRecord>,
 }
 
@@ -152,10 +222,12 @@ impl Manifest {
     /// fail without being overwritten.
     pub fn load(dir: &Path) -> Self {
         let path = default_manifest_path(dir);
-        Self::load_from_path(&path).unwrap_or_else(|e| {
+        let manifest = Self::load_from_path(&path).unwrap_or_else(|e| {
             warn!("Failed to load manifest: {}. Starting fresh.", e);
             Self::default()
-        })
+        });
+        manifest.warn_legacy_issue_directories(dir);
+        manifest
     }
 
     /// Load a manifest from an exact path.
@@ -200,7 +272,71 @@ impl Manifest {
         manifest.touched_root_snapshots.clear();
         manifest.normalize_issue_keys();
         manifest.sanitize_artifact_paths();
+        manifest.warn_legacy_nested_snapshots();
         Ok(manifest)
+    }
+
+    pub fn legacy_issue_directory_warnings(
+        &self,
+        output_root: &Path,
+    ) -> Vec<LegacyIssueDirectoryWarning> {
+        let mut warnings = Vec::new();
+        let mut checked = HashSet::new();
+
+        for (issue_key, entry) in &self.issues {
+            collect_legacy_issue_directory_warning(
+                output_root,
+                issue_key,
+                issue_key,
+                &mut checked,
+                &mut warnings,
+            );
+            for artifact in &entry.artifact_paths {
+                if let Some(path) = sanitize_artifact_path(&artifact.path) {
+                    collect_legacy_artifact_path_warnings(
+                        output_root,
+                        issue_key,
+                        &path,
+                        &mut checked,
+                        &mut warnings,
+                    );
+                }
+            }
+        }
+
+        warnings
+    }
+
+    pub fn warn_legacy_issue_directories(&self, output_root: &Path) {
+        for warning in self.legacy_issue_directory_warnings(output_root) {
+            warn!(
+                "Legacy case-mismatched Issue directory for {} found at {:?} (directory entry {:?}, expected {:?}); not migrating automatically.",
+                warning.issue_key, warning.path, warning.found_name, warning.expected_name
+            );
+        }
+    }
+
+    pub fn legacy_nested_snapshot_warnings(&self) -> Vec<LegacyNestedSnapshotWarning> {
+        let mut warnings = Vec::new();
+        for (root_key, snapshot) in &self.root_snapshots {
+            if snapshot.layout == "nested" && is_legacy_nested_snapshot_path(&snapshot.path) {
+                warnings.push(LegacyNestedSnapshotWarning {
+                    root_key: normalize_issue_key(root_key),
+                    path: snapshot.path.clone(),
+                });
+            }
+        }
+        warnings.sort_by(|a, b| a.root_key.cmp(&b.root_key));
+        warnings
+    }
+
+    pub fn warn_legacy_nested_snapshots(&self) {
+        for warning in self.legacy_nested_snapshot_warnings() {
+            warn!(
+                "Legacy nested hierarchy snapshot for {} found at {}; keeping it readable but new nested exports write {{ROOT}}.hierarchy.md and do not delete or migrate index.md automatically.",
+                warning.root_key, warning.path
+            );
+        }
     }
 
     /// Write the default manifest atomically to the given output directory.
@@ -379,13 +515,13 @@ impl Manifest {
     }
 
     /// Mark an active Issue as evicted without deleting files.
-    pub fn evict(&mut self, issue_key: &str, reason: &str) {
+    pub fn evict(&mut self, issue_key: &str, reason: EvictionReason) {
         let key = normalize_issue_key(issue_key);
         let Some(entry) = self.issues.get_mut(&key) else {
             return;
         };
         entry.state = IssueCacheState::Evicted;
-        entry.eviction_reason = Some(reason.to_string());
+        entry.eviction_reason = Some(reason);
         for path in &mut entry.artifact_paths {
             path.active = false;
         }
@@ -427,6 +563,8 @@ impl Manifest {
                 path: snapshot_path.into(),
                 exported_at: Utc::now(),
                 truncated: hierarchy_truncated(root),
+                truncated_by_depth: hierarchy_truncated_by_depth(root),
+                truncated_by_issue_count: hierarchy_truncated_by_issue_count(root),
                 failures: hierarchy_failures(root),
             },
         );
@@ -638,25 +776,14 @@ impl Manifest {
             self.replace_active_edges_for_parent(&key, &node.children);
         }
         for failure in &node.failures {
-            if failure.reason == "fetch_not_found_or_forbidden" {
-                self.evict(&failure.issue_key, &failure.reason);
+            if failure.reason == EvictionReason::FETCH_NOT_FOUND_OR_FORBIDDEN {
+                self.evict(&failure.issue_key, EvictionReason::FetchNotFoundOrForbidden);
             }
         }
 
         if let Some(parent_key) = parent_key {
             let parent = normalize_issue_key(parent_key);
-            if !self
-                .edges
-                .iter()
-                .any(|edge| edge.parent == parent && edge.child == key && edge.active)
-            {
-                self.touched_edge_parents.insert(parent.clone());
-                self.edges.push(HierarchyEdge {
-                    parent,
-                    child: key.clone(),
-                    active: true,
-                });
-            }
+            self.upsert_active_edge(&parent, &key);
         }
 
         for child in &node.children {
@@ -730,6 +857,43 @@ impl Manifest {
                 edge.active = false;
                 self.touched_edge_parents.insert(parent.clone());
             }
+        }
+    }
+
+    fn upsert_active_edge(&mut self, parent: &str, child: &str) {
+        let parent = normalize_issue_key(parent);
+        let child = normalize_issue_key(child);
+        let mut next_edges = Vec::with_capacity(self.edges.len());
+        let mut found_pair = false;
+        let mut changed = false;
+
+        for mut edge in self.edges.drain(..) {
+            if edge.parent == parent && edge.child == child {
+                if found_pair {
+                    changed = true;
+                    continue;
+                }
+                found_pair = true;
+                if !edge.active {
+                    edge.active = true;
+                    changed = true;
+                }
+            }
+            next_edges.push(edge);
+        }
+
+        if !found_pair {
+            next_edges.push(HierarchyEdge {
+                parent: parent.clone(),
+                child,
+                active: true,
+            });
+            changed = true;
+        }
+
+        self.edges = next_edges;
+        if changed {
+            self.touched_edge_parents.insert(parent);
         }
     }
 
@@ -819,6 +983,8 @@ impl Manifest {
                 updated: String::new(),
                 children_discovered: false,
                 truncated: false,
+                truncated_by_depth: false,
+                truncated_by_issue_count: false,
                 failures: Vec::new(),
                 children: Vec::new(),
             });
@@ -840,6 +1006,8 @@ impl Manifest {
             updated: entry.updated.clone(),
             children_discovered: false,
             truncated: false,
+            truncated_by_depth: false,
+            truncated_by_issue_count: false,
             failures: Vec::new(),
             children,
         })
@@ -1083,6 +1251,54 @@ fn push_unique(values: &mut Vec<String>, value: String) {
     }
 }
 
+fn collect_legacy_artifact_path_warnings(
+    output_root: &Path,
+    issue_key: &str,
+    artifact_path: &str,
+    checked: &mut HashSet<(PathBuf, String)>,
+    warnings: &mut Vec<LegacyIssueDirectoryWarning>,
+) {
+    let mut parent = output_root.to_path_buf();
+    for segment in artifact_path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+    {
+        if normalize_issue_key(segment) == normalize_issue_key(issue_key) {
+            collect_legacy_issue_directory_warning(&parent, issue_key, segment, checked, warnings);
+        }
+        parent.push(segment);
+    }
+}
+
+fn collect_legacy_issue_directory_warning(
+    parent: &Path,
+    issue_key: &str,
+    expected_name: &str,
+    checked: &mut HashSet<(PathBuf, String)>,
+    warnings: &mut Vec<LegacyIssueDirectoryWarning>,
+) {
+    let canonical_key = normalize_issue_key(issue_key);
+    let expected_name = normalize_issue_key(expected_name);
+    if !checked.insert((parent.to_path_buf(), expected_name.clone())) {
+        return;
+    }
+
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let found_name = entry.file_name().to_string_lossy().to_string();
+        if found_name.eq_ignore_ascii_case(&expected_name) && found_name != expected_name {
+            warnings.push(LegacyIssueDirectoryWarning {
+                issue_key: canonical_key.clone(),
+                path: entry.path(),
+                found_name,
+                expected_name: expected_name.clone(),
+            });
+        }
+    }
+}
+
 fn upsert_artifact_path(paths: &mut Vec<ArtifactPath>, path: String, active: bool) {
     if let Some(existing) = paths.iter_mut().find(|artifact| artifact.path == path) {
         existing.active = active;
@@ -1112,8 +1328,20 @@ fn normalize_artifact_path(path: &str) -> String {
     })
 }
 
+fn is_legacy_nested_snapshot_path(path: &str) -> bool {
+    path.replace('\\', "/").trim_start_matches("./") == "index.md"
+}
+
 fn hierarchy_truncated(node: &IssueNode) -> bool {
     node.truncated || node.children.iter().any(hierarchy_truncated)
+}
+
+fn hierarchy_truncated_by_depth(node: &IssueNode) -> bool {
+    node.truncated_by_depth || node.children.iter().any(hierarchy_truncated_by_depth)
+}
+
+fn hierarchy_truncated_by_issue_count(node: &IssueNode) -> bool {
+    node.truncated_by_issue_count || node.children.iter().any(hierarchy_truncated_by_issue_count)
 }
 
 fn hierarchy_failures(node: &IssueNode) -> Vec<HierarchyFailureRecord> {
@@ -1270,6 +1498,88 @@ mod tests {
     }
 
     #[test]
+    fn eviction_reason_serializes_stable_manifest_strings() {
+        let cases = [
+            (
+                EvictionReason::NotReturnedByValidationSearch,
+                EvictionReason::NOT_RETURNED_BY_VALIDATION_SEARCH,
+            ),
+            (
+                EvictionReason::FetchNotFoundOrForbidden,
+                EvictionReason::FETCH_NOT_FOUND_OR_FORBIDDEN,
+            ),
+            (
+                EvictionReason::ChildFetchOrExportFailed,
+                EvictionReason::CHILD_FETCH_OR_EXPORT_FAILED,
+            ),
+            (
+                EvictionReason::ForceFetchFailed,
+                EvictionReason::FORCE_FETCH_FAILED,
+            ),
+        ];
+
+        for (reason, expected) in cases {
+            let encoded = serde_json::to_string(&reason).unwrap();
+            assert_eq!(encoded, format!(r#""{}""#, expected));
+            let decoded: EvictionReason = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, reason);
+        }
+    }
+
+    #[test]
+    fn unknown_legacy_eviction_reason_loads_and_round_trips() {
+        let encoded = r#""legacy_custom_reason""#;
+        let decoded: EvictionReason = serde_json::from_str(encoded).unwrap();
+        assert_eq!(
+            decoded,
+            EvictionReason::Unknown("legacy_custom_reason".to_string())
+        );
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+    }
+
+    #[test]
+    fn legacy_nested_index_snapshot_loads_and_reports_compatibility_warning() {
+        let dir = temp_dir("legacy-nested-index-snapshot");
+        let path = default_manifest_path(&dir);
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 2,
+                "issues": {},
+                "edges": [],
+                "root_snapshots": {
+                    "a": {
+                        "root_key": "a",
+                        "layout": "nested",
+                        "path": "index.md",
+                        "exported_at": "2026-01-01T00:00:00Z",
+                        "truncated": false,
+                        "failures": []
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let manifest = Manifest::load_from_path(&path).unwrap();
+
+        assert_eq!(manifest.root_snapshots["A"].path, "index.md");
+        assert_eq!(
+            manifest.legacy_nested_snapshot_warnings(),
+            vec![LegacyNestedSnapshotWarning {
+                root_key: "A".to_string(),
+                path: "index.md".to_string(),
+            }]
+        );
+        assert!(
+            !dir.join("A.hierarchy.md").exists(),
+            "loading a legacy nested snapshot must not migrate files"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn v1_manifest_loads_and_saves_back_as_v2() {
         let dir = temp_dir("v1");
         let path = default_manifest_path(&dir);
@@ -1321,6 +1631,24 @@ mod tests {
     }
 
     #[test]
+    fn legacy_issue_directory_warning_uses_actual_directory_entry_casing() {
+        let dir = temp_dir("legacy-issue-dir-casing");
+        std::fs::create_dir_all(dir.join("proj-1")).unwrap();
+
+        let mut manifest = Manifest::default();
+        manifest.record("PROJ-1", "2026-01-01T00:00:00.000+0000");
+
+        let warnings = manifest.legacy_issue_directory_warnings(&dir);
+        assert_eq!(warnings.len(), 1, "warnings: {:?}", warnings);
+        assert_eq!(warnings[0].issue_key, "PROJ-1");
+        assert_eq!(warnings[0].found_name, "proj-1");
+        assert_eq!(warnings[0].expected_name, "PROJ-1");
+        assert_eq!(warnings[0].path, dir.join("proj-1"));
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn merge_on_write_preserves_untouched_disk_entries() {
         let dir = temp_dir("merge");
         let path = default_manifest_path(&dir);
@@ -1348,13 +1676,13 @@ mod tests {
         let mut manifest = Manifest::default();
         manifest.record("PROJ-1", "one");
 
-        manifest.evict("proj-1", "not_returned_by_validation_search");
+        manifest.evict("proj-1", EvictionReason::NotReturnedByValidationSearch);
 
         let entry = manifest.get("PROJ-1").unwrap();
         assert_eq!(entry.state, IssueCacheState::Evicted);
         assert_eq!(
-            entry.eviction_reason.as_deref(),
-            Some("not_returned_by_validation_search")
+            entry.eviction_reason,
+            Some(EvictionReason::NotReturnedByValidationSearch)
         );
         assert_eq!(entry.artifact_paths.len(), 1);
         assert!(!entry.artifact_paths[0].active);
@@ -1524,6 +1852,79 @@ mod tests {
     }
 
     #[test]
+    fn relinking_hierarchy_edge_reactivates_existing_edge_without_duplicates() {
+        let mut manifest = Manifest::default();
+        manifest.record_hierarchy(
+            &hierarchy_node("A", vec![hierarchy_node("B", vec![])]),
+            "A.hierarchy.md",
+            HierarchyLayout::Corpus,
+            None,
+        );
+
+        for _ in 0..2 {
+            manifest.record_hierarchy(
+                &hierarchy_node("A", vec![]),
+                "A.hierarchy.md",
+                HierarchyLayout::Corpus,
+                None,
+            );
+            manifest.record_hierarchy(
+                &hierarchy_node("A", vec![hierarchy_node("B", vec![])]),
+                "A.hierarchy.md",
+                HierarchyLayout::Corpus,
+                None,
+            );
+        }
+
+        let matching_edges: Vec<_> = manifest
+            .edges
+            .iter()
+            .filter(|edge| edge.parent == "A" && edge.child == "B")
+            .collect();
+        assert_eq!(matching_edges.len(), 1);
+        assert!(matching_edges[0].active);
+    }
+
+    #[test]
+    fn relinking_hierarchy_edge_collapses_touched_legacy_duplicates() {
+        let mut manifest = Manifest::default();
+        manifest.edges.push(HierarchyEdge {
+            parent: "A".to_string(),
+            child: "B".to_string(),
+            active: false,
+        });
+        manifest.edges.push(HierarchyEdge {
+            parent: "A".to_string(),
+            child: "B".to_string(),
+            active: false,
+        });
+        manifest.edges.push(HierarchyEdge {
+            parent: "A".to_string(),
+            child: "C".to_string(),
+            active: true,
+        });
+
+        manifest.record_hierarchy(
+            &hierarchy_node("A", vec![hierarchy_node("B", vec![])]),
+            "A.hierarchy.md",
+            HierarchyLayout::Corpus,
+            None,
+        );
+
+        let ab_edges: Vec<_> = manifest
+            .edges
+            .iter()
+            .filter(|edge| edge.parent == "A" && edge.child == "B")
+            .collect();
+        assert_eq!(ab_edges.len(), 1);
+        assert!(ab_edges[0].active);
+        assert!(manifest
+            .edges
+            .iter()
+            .any(|edge| edge.parent == "A" && edge.child == "C" && !edge.active));
+    }
+
+    #[test]
     fn truncated_hierarchy_record_preserves_unvisited_old_edges() {
         let mut manifest = Manifest::default();
         manifest.record_hierarchy(
@@ -1545,6 +1946,71 @@ mod tests {
             .iter()
             .any(|edge| edge.parent == "A" && edge.child == "C" && edge.active));
         assert!(manifest.root_snapshots["A"].truncated);
+    }
+
+    #[test]
+    fn root_snapshot_records_depth_truncation_cause() {
+        let mut manifest = Manifest::default();
+        let mut capped = hierarchy_node("C", vec![]);
+        capped.truncated = true;
+        capped.truncated_by_depth = true;
+
+        manifest.record_hierarchy(
+            &hierarchy_node("A", vec![hierarchy_node("B", vec![capped])]),
+            "A.hierarchy.md",
+            HierarchyLayout::Corpus,
+            None,
+        );
+
+        let snapshot = &manifest.root_snapshots["A"];
+        assert!(snapshot.truncated);
+        assert!(snapshot.truncated_by_depth);
+        assert!(!snapshot.truncated_by_issue_count);
+    }
+
+    #[test]
+    fn root_snapshot_records_issue_count_truncation_cause() {
+        let mut manifest = Manifest::default();
+        let mut capped = hierarchy_node("A", vec![hierarchy_node("B", vec![])]);
+        capped.truncated = true;
+        capped.truncated_by_issue_count = true;
+
+        manifest.record_hierarchy(&capped, "A.hierarchy.md", HierarchyLayout::Corpus, None);
+
+        let snapshot = &manifest.root_snapshots["A"];
+        assert!(snapshot.truncated);
+        assert!(!snapshot.truncated_by_depth);
+        assert!(snapshot.truncated_by_issue_count);
+    }
+
+    #[test]
+    fn old_root_snapshot_defaults_missing_truncation_causes_without_inference() {
+        let dir = temp_dir("old-root-truncation");
+        let path = default_manifest_path(&dir);
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 2,
+                "issues": {},
+                "root_snapshots": {
+                    "A": {
+                        "root_key": "A",
+                        "layout": "corpus",
+                        "path": "A.hierarchy.md",
+                        "exported_at": "2026-01-02T00:00:00Z",
+                        "truncated": true
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let manifest = Manifest::load_from_path(&path).unwrap();
+        let snapshot = &manifest.root_snapshots["A"];
+        assert!(snapshot.truncated);
+        assert!(!snapshot.truncated_by_depth);
+        assert!(!snapshot.truncated_by_issue_count);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1655,7 +2121,7 @@ mod tests {
             None,
         );
 
-        manifest.evict("C", "not_returned_by_validation_search");
+        manifest.evict("C", EvictionReason::NotReturnedByValidationSearch);
 
         assert!(manifest.active_artifact_paths("C").is_empty());
         assert!(manifest
@@ -1741,7 +2207,7 @@ mod tests {
 
         let mut current_invocation = Manifest::load_from_path(&path).unwrap();
         let mut other_invocation = Manifest::load_from_path(&path).unwrap();
-        other_invocation.evict("C", "not_returned_by_validation_search");
+        other_invocation.evict("C", EvictionReason::NotReturnedByValidationSearch);
         other_invocation.save_to_path(&path).unwrap();
 
         current_invocation.record_hierarchy(
@@ -1771,6 +2237,8 @@ mod tests {
             updated: "2026-01-01T00:00:00.000+0000".to_string(),
             children_discovered: true,
             truncated: false,
+            truncated_by_depth: false,
+            truncated_by_issue_count: false,
             failures: Vec::new(),
             children,
         }

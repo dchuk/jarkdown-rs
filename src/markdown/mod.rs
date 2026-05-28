@@ -104,9 +104,7 @@ mod tests {
     /// [`compose`] directly via a literal [`RenderContext`].
     #[test]
     fn skipped_attachments_render_names_and_source_urls_without_local_placeholders() {
-        use crate::issue::{
-            Progress, Project, TimeTracking, Votes, Watches, WorklogPage,
-        };
+        use crate::issue::{Progress, Project, TimeTracking, Votes, Watches, WorklogPage};
         let issue_data = json!({
             "key": "K1",
             "renderedFields": {},

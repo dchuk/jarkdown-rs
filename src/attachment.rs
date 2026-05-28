@@ -62,7 +62,10 @@ impl<'a> AttachmentHandler<'a> {
         attachment: &Value,
         output_dir: &Path,
     ) -> Result<DownloadedAttachment> {
-        let filename = attachment["filename"].as_str().unwrap_or("unknown").to_string();
+        let filename = attachment["filename"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string();
         let content_url = attachment["content"].as_str().unwrap_or("").to_string();
         let mime_type = attachment["mimeType"].as_str().unwrap_or("").to_string();
         let size = attachment["size"].as_u64().unwrap_or(0);
@@ -73,7 +76,10 @@ impl<'a> AttachmentHandler<'a> {
         let mut counter = 1u32;
         let original_path = file_path.clone();
         while file_path.exists() {
-            let stem = original_path.file_stem().unwrap_or_default().to_string_lossy();
+            let stem = original_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy();
             let ext = original_path
                 .extension()
                 .map(|e| format!(".{}", e.to_string_lossy()))
@@ -97,7 +103,11 @@ impl<'a> AttachmentHandler<'a> {
 
         Ok(DownloadedAttachment {
             attachment_id: attachment["id"].as_str().map(|s| s.to_string()),
-            filename: file_path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+            filename: file_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
             original_filename: filename,
             mime_type,
             path: file_path,

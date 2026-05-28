@@ -291,8 +291,7 @@ pub(crate) fn custom_fields(ctx: &RenderContext<'_>) -> Vec<String> {
     custom_fields.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
 
     let attachments_ref = &ctx.attachments;
-    let renderer =
-        CustomFieldRenderer::new(|v: &Value| parse_adf_to_markdown(v, attachments_ref));
+    let renderer = CustomFieldRenderer::new(|v: &Value| parse_adf_to_markdown(v, attachments_ref));
 
     let mut lines = vec!["## Custom Fields".into(), String::new()];
 
@@ -360,7 +359,11 @@ pub(crate) fn changelog(ctx: &RenderContext<'_>) -> Vec<String> {
         Some(c) => c,
         None => return Vec::new(),
     };
-    let plural = if cl.entry_count == 1 { "entry" } else { "entries" };
+    let plural = if cl.entry_count == 1 {
+        "entry"
+    } else {
+        "entries"
+    };
     vec![
         "## Changelog".into(),
         String::new(),
@@ -400,7 +403,9 @@ pub(crate) fn attachments(ctx: &RenderContext<'_>) -> Vec<String> {
                     .copied()
                     .unwrap_or(usize::MAX)
             };
-            rank(a).cmp(&rank(b)).then_with(|| a.filename.cmp(&b.filename))
+            rank(a)
+                .cmp(&rank(b))
+                .then_with(|| a.filename.cmp(&b.filename))
         });
         for att in ordered {
             let encoded = url_encode(&att.filename);
@@ -490,7 +495,11 @@ fn generate_metadata(issue: &Issue) -> serde_yaml::Value {
         issue.resolution.as_ref().map(|r| r.name.as_str()),
     );
     set_str(&mut map, "project", some_if_not_empty(&issue.project.name));
-    set_str(&mut map, "project_key", some_if_not_empty(&issue.project.key));
+    set_str(
+        &mut map,
+        "project_key",
+        some_if_not_empty(&issue.project.key),
+    );
     set_str(
         &mut map,
         "assignee",
@@ -507,11 +516,8 @@ fn generate_metadata(issue: &Issue) -> serde_yaml::Value {
         issue.creator.as_ref().map(|u| u.display_name.as_str()),
     );
 
-    let labels: Vec<serde_yaml::Value> = issue
-        .labels
-        .iter()
-        .map(|s| Y::String(s.clone()))
-        .collect();
+    let labels: Vec<serde_yaml::Value> =
+        issue.labels.iter().map(|s| Y::String(s.clone())).collect();
     map.insert(Y::String("labels".into()), Y::Sequence(labels));
 
     let components: Vec<serde_yaml::Value> = issue
@@ -526,10 +532,7 @@ fn generate_metadata(issue: &Issue) -> serde_yaml::Value {
     set_str(
         &mut map,
         "parent_key",
-        issue
-            .parent
-            .as_ref()
-            .and_then(|p| p["key"].as_str()),
+        issue.parent.as_ref().and_then(|p| p["key"].as_str()),
     );
     set_str(
         &mut map,
@@ -560,9 +563,17 @@ fn generate_metadata(issue: &Issue) -> serde_yaml::Value {
     set_str(&mut map, "duedate", issue.duedate.as_deref());
 
     let tt = &issue.timetracking;
-    set_str(&mut map, "original_estimate", tt.original_estimate.as_deref());
+    set_str(
+        &mut map,
+        "original_estimate",
+        tt.original_estimate.as_deref(),
+    );
     set_str(&mut map, "time_spent", tt.time_spent.as_deref());
-    set_str(&mut map, "remaining_estimate", tt.remaining_estimate.as_deref());
+    set_str(
+        &mut map,
+        "remaining_estimate",
+        tt.remaining_estimate.as_deref(),
+    );
 
     map.insert(
         Y::String("progress".into()),
@@ -722,8 +733,7 @@ mod tests {
         };
 
         let rendered = comments(&ctx).join("\n");
-        let expected =
-            "## Comments\n\n**Alice** - _2024-01-15 10:30 AM_\n\nhello world\n";
+        let expected = "## Comments\n\n**Alice** - _2024-01-15 10:30 AM_\n\nhello world\n";
         assert_eq!(rendered, expected);
     }
 
@@ -742,9 +752,7 @@ mod tests {
             updated: "2026-05-22T10:00:00.000+0000".into(),
             duedate: Some("2026-06-30".into()),
             resolutiondate: None,
-            issuetype: IssueType {
-                name: "Bug".into(),
-            },
+            issuetype: IssueType { name: "Bug".into() },
             status: Status {
                 name: "Open".into(),
                 category: Some("To Do".into()),

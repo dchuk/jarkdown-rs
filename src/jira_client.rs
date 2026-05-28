@@ -11,6 +11,7 @@ use crate::retry::{retry_with_backoff, RetryConfig};
 
 const VALIDATION_CHUNK_SIZE: usize = 50;
 const VALIDATION_PAGE_SIZE: u32 = 50;
+const VALIDATION_MAX_PAGES_PER_CHUNK: usize = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationIssue {
@@ -199,8 +200,10 @@ impl JiraApiClient {
         for chunk in keys.chunks(VALIDATION_CHUNK_SIZE) {
             let jql = validation_jql(chunk);
             let mut next_page_token: Option<String> = None;
+            let mut seen_keys = std::collections::HashSet::new();
+            let requested_keys: std::collections::HashSet<String> = chunk.iter().cloned().collect();
 
-            loop {
+            for page_number in 0..VALIDATION_MAX_PAGES_PER_CHUNK {
                 let mut query_params: Vec<(String, String)> = vec![
                     ("jql".into(), jql.clone()),
                     ("maxResults".into(), VALIDATION_PAGE_SIZE.to_string()),
@@ -215,14 +218,34 @@ impl JiraApiClient {
                 let data = Self::handle_response(response, None).await?;
                 let page_issues = data["issues"].as_array().cloned().unwrap_or_default();
                 let page_empty = page_issues.is_empty();
-                out.extend(
-                    page_issues
-                        .into_iter()
-                        .filter_map(validation_issue_from_value),
-                );
-                next_page_token = data["nextPageToken"].as_str().map(|s| s.to_string());
-                if next_page_token.is_none() || page_empty {
+                for issue in page_issues
+                    .into_iter()
+                    .filter_map(validation_issue_from_value)
+                {
+                    if requested_keys.contains(&issue.key) {
+                        seen_keys.insert(issue.key.clone());
+                    }
+                    out.push(issue);
+                }
+                next_page_token = data["nextPageToken"]
+                    .as_str()
+                    .filter(|token| !token.is_empty())
+                    .map(|s| s.to_string());
+                if next_page_token.is_none()
+                    || page_empty
+                    || seen_keys.len() == requested_keys.len()
+                {
                     break;
+                }
+
+                if page_number + 1 == VALIDATION_MAX_PAGES_PER_CHUNK {
+                    return Err(JarkdownError::JiraApi {
+                        message: format!(
+                            "Validation pagination exceeded max pages per chunk ({}) for JQL: {}",
+                            VALIDATION_MAX_PAGES_PER_CHUNK, jql
+                        ),
+                        status_code: None,
+                    });
                 }
             }
         }
@@ -341,6 +364,7 @@ impl JiraApiClient {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::io::{Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
@@ -407,6 +431,82 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn validate_issue_keys_empty_next_page_token_terminates_pagination() {
+        let server = ValidationSequenceServer::start(vec![
+            r#"{"nextPageToken":"","issues":[{"key":"PROJ-1","fields":{"updated":"2026-01-01T00:00:00.000+0000"}}]}"#,
+        ]);
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let keys = vec!["PROJ-1".to_string(), "PROJ-2".to_string()];
+
+        let results = client
+            .validate_issue_keys(&keys)
+            .await
+            .expect("validate issue keys");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(server.observed_paths().len(), 1);
+        assert!(
+            !server
+                .observed_paths()
+                .iter()
+                .any(|path| path.contains("nextPageToken=")),
+            "empty token should not be re-sent: {:?}",
+            server.observed_paths()
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_issue_keys_stops_after_all_chunk_keys_seen() {
+        let server = ValidationSequenceServer::start(vec![
+            r#"{"nextPageToken":"page-2","issues":[{"key":"PROJ-1","fields":{"updated":"2026-01-01T00:00:00.000+0000"}},{"key":"PROJ-2","fields":{"updated":"2026-01-02T00:00:00.000+0000"}}]}"#,
+            r#"{"issues":[{"key":"PROJ-3","fields":{"updated":"2026-01-03T00:00:00.000+0000"}}]}"#,
+        ]);
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let keys = vec!["PROJ-1".to_string(), "PROJ-2".to_string()];
+
+        let results = client
+            .validate_issue_keys(&keys)
+            .await
+            .expect("validate issue keys");
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(server.observed_paths().len(), 1);
+        assert!(
+            !server
+                .observed_paths()
+                .iter()
+                .any(|path| path.contains("nextPageToken=page-2")),
+            "all requested keys were seen, so page 2 should not be fetched: {:?}",
+            server.observed_paths()
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_issue_keys_errors_after_max_pages_per_chunk() {
+        let server = ValidationSequenceServer::start(vec![
+            r#"{"nextPageToken":"again","issues":[{"key":"OTHER-1","fields":{"updated":"2026-01-01T00:00:00.000+0000"}}]}"#,
+        ]);
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let keys = vec!["PROJ-1".to_string()];
+
+        let err = client
+            .validate_issue_keys(&keys)
+            .await
+            .expect_err("validation should fail after max pages");
+        let message = err.to_string();
+
+        assert!(
+            message.contains("Validation pagination") && message.contains("max pages"),
+            "expected clear max-pages error, got: {}",
+            message
+        );
+        assert_eq!(
+            server.observed_paths().len(),
+            VALIDATION_MAX_PAGES_PER_CHUNK
+        );
+    }
+
     struct PaginatedChangelogServer {
         base_url: String,
         requests: Arc<Mutex<Vec<String>>>,
@@ -415,6 +515,43 @@ mod tests {
     struct ValidationServer {
         base_url: String,
         requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct ValidationSequenceServer {
+        base_url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ValidationSequenceServer {
+        fn start(bodies: Vec<&'static str>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let base_url = format!("http://{}", addr);
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let bodies = bodies
+                .into_iter()
+                .map(str::to_string)
+                .collect::<VecDeque<_>>();
+            let bodies = Arc::new(Mutex::new(bodies));
+            let requests_for_thread = requests.clone();
+            let bodies_for_thread = bodies.clone();
+
+            thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    handle_validation_sequence_request(
+                        stream,
+                        &requests_for_thread,
+                        &bodies_for_thread,
+                    );
+                }
+            });
+
+            Self { base_url, requests }
+        }
+
+        fn observed_paths(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
     }
 
     impl ValidationServer {
@@ -498,6 +635,38 @@ mod tests {
             }
         } else {
             "{}".to_string()
+        };
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(resp.as_bytes()).expect("write");
+    }
+
+    fn handle_validation_sequence_request(
+        mut stream: TcpStream,
+        requests: &Arc<Mutex<Vec<String>>>,
+        bodies: &Arc<Mutex<VecDeque<String>>>,
+    ) {
+        let mut buf = [0u8; 8192];
+        let n = stream.read(&mut buf).expect("read");
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let path = req
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_string();
+        requests.lock().unwrap().push(path);
+
+        let body = {
+            let mut bodies = bodies.lock().unwrap();
+            if bodies.len() > 1 {
+                bodies.pop_front().unwrap()
+            } else {
+                bodies.front().cloned().unwrap_or_else(|| "{}".to_string())
+            }
         };
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

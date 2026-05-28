@@ -34,6 +34,20 @@ An Evicted Issue stays in the manifest as an inactive tombstone. Its files are
 not deleted. Artifact paths for evicted Issues are marked inactive so later
 refreshes do not write through stale paths.
 
+`eviction_reason` is a stable string vocabulary:
+
+- `not_returned_by_validation_search`: a successful incremental validation
+  search omitted an active cached Issue.
+- `fetch_not_found_or_forbidden`: hierarchy traversal could not fetch a child
+  because Jira returned not found or forbidden.
+- `child_fetch_or_export_failed`: hierarchy traversal could not fetch or export
+  a child for another reason.
+- `force_fetch_failed`: `--force` targeted an evicted root, but the full
+  fetch/export failed, so the root remains evicted.
+
+Unknown legacy reason strings are accepted when loading older manifests and are
+written back unchanged. New jarkdown producers use the typed vocabulary above.
+
 ## Option Fingerprint
 
 The option fingerprint is versioned. The current format starts with `v1:` and
@@ -71,22 +85,35 @@ Root snapshots record the last hierarchy snapshot for each Requested Root:
 
 - root key
 - layout (`corpus` or `nested`)
-- snapshot path (`{ROOT}.hierarchy.md` for corpus, `index.md` for nested)
+- snapshot path (`{ROOT}.hierarchy.md` for new corpus and nested exports)
 - export timestamp
-- whether the traversal was truncated by depth or issue cap
+- `truncated`, the compatibility boolean for any traversal truncation
+- `truncated_by_depth`, true when `max_depth` stopped traversal
+- `truncated_by_issue_count`, true when `max_issues` stopped traversal
 - child-fetch failures recorded during traversal
 
 Snapshots are traversal snapshots, not live views. Descendant-only refreshes can
 update changed artifacts without rebuilding unchanged ancestor snapshots.
+Older manifests that only contain `truncated` load with both cause fields
+defaulting to `false`; jarkdown does not infer causes for historical snapshots.
+Older nested exports that recorded `index.md` remain readable. When such a
+manifest is loaded, jarkdown warns and preserves the legacy path without
+deleting or migrating the file.
 
 ## Layouts
 
-`corpus` layout writes one canonical artifact directory per Issue below the
-output root.
+`corpus` layout writes one canonical uppercase artifact directory per Issue
+below the output root. Producers record manifest `artifact_paths` using the
+same byte-for-byte directory casing that new exports create on disk. When a
+manifest is loaded for an output root, jarkdown scans directory entry names and
+warns if it finds an older case-mismatched Issue directory such as `proj-1/`
+for canonical key `PROJ-1`; it does not rename or migrate that directory.
 
 `nested` layout writes tree-shaped artifact directories for browsing. Because
 the same Issue may appear in multiple trees, manifest v2 records every active
-artifact path for each Issue.
+artifact path for each Issue. New nested root snapshots use
+`{ROOT}.hierarchy.md`, so multiple Requested Roots in one output directory have
+distinct snapshot files and distinct manifest paths.
 
 `--incremental --hierarchy` defaults to `corpus`. Non-incremental hierarchy
 export may keep the legacy `nested` default for compatibility.

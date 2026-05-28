@@ -39,6 +39,8 @@ pub mod issue;
 pub mod jira_client;
 pub mod manifest;
 pub mod markdown;
+#[doc(hidden)]
+pub mod planner;
 pub mod retry;
 
 // Re-export key types for library consumers
@@ -53,7 +55,7 @@ pub use freshness::{plan as plan_export, ExportPlan};
 pub use hierarchy::{HierarchyExporter, HierarchyLayout, HierarchyOptions, IssueNode};
 pub use issue::{ChangelogEntry, ChangelogItem, Comment, Issue, IssueSearchResult, RichText};
 pub use jira_client::JiraApiClient;
-pub use manifest::Manifest;
+pub use manifest::{EvictionReason, Manifest};
 pub use markdown::{compose, AttachmentIndex, CustomFieldMetadata, RenderContext};
 pub use retry::RetryConfig;
 
@@ -105,15 +107,18 @@ pub async fn export_issue(
     output_dir: Option<&Path>,
     options: ExportOptions,
 ) -> Result<PathBuf> {
-    let output_path = output_dir.map(|d| d.join(issue_key)).unwrap_or_else(|| {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(issue_key)
-    });
+    let canonical_key = manifest::normalize_issue_key(issue_key);
+    let output_path = output_dir
+        .map(|d| d.join(&canonical_key))
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(&canonical_key)
+        });
 
     perform_export_with_options(
         client,
-        issue_key,
+        &canonical_key,
         &output_path,
         ExportWorkflowOptions {
             refresh_fields: options.refresh_fields,

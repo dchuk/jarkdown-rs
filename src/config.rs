@@ -81,12 +81,15 @@ impl ConfigManager {
                     .collect(),
             )
         } else {
-            fields_config.get("include").and_then(|v| v.as_array()).map(|inc_arr| {
-                inc_arr
-                    .iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
+            fields_config
+                .get("include")
+                .and_then(|v| v.as_array())
+                .map(|inc_arr| {
+                    inc_arr
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
         };
 
         // Determine exclude list
