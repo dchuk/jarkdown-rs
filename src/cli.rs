@@ -111,6 +111,34 @@ pub struct SharedArgs {
     /// to a sibling `{KEY}.changelog.md` file.
     #[arg(long)]
     pub include_changelog: bool,
+
+    /// Write a machine-readable run summary (reexported/skipped/failed issue
+    /// keys) as JSON to this path. Flat bulk/query only.
+    #[arg(long)]
+    pub summary_json: Option<String>,
+}
+
+impl SharedArgs {
+    /// Warnings for flags that have no effect given the rest of this invocation.
+    ///
+    /// Emitting these on stderr prevents a flag from silently no-op'ing (which is
+    /// what caused the original misdiagnosis of incremental export). `--manifest`
+    /// is intentionally NOT listed: it now persists the manifest on its own.
+    pub fn ineffective_flag_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.force && !self.incremental {
+            warnings.push(
+                "--force has no effect without --incremental (there is nothing to override); ignoring it".to_string(),
+            );
+        }
+        if self.summary_json.is_some() && self.hierarchy {
+            warnings.push(
+                "--summary-json is not supported with --hierarchy; no summary will be written"
+                    .to_string(),
+            );
+        }
+        warnings
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -286,5 +314,43 @@ mod tests {
             }
             _ => panic!("expected bulk command"),
         }
+    }
+
+    #[test]
+    fn force_without_incremental_is_reported_as_ineffective() {
+        let args = SharedArgs::try_parse_from(["x", "--force"]).expect("parse");
+        let warnings = args.ineffective_flag_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("--force") && w.contains("--incremental")),
+            "expected a warning that --force needs --incremental, got {:?}",
+            warnings
+        );
+
+        let with_incremental =
+            SharedArgs::try_parse_from(["x", "--force", "--incremental"]).expect("parse");
+        assert!(
+            with_incremental.ineffective_flag_warnings().is_empty(),
+            "no warning expected when --incremental is present"
+        );
+    }
+
+    #[test]
+    fn summary_json_with_hierarchy_is_reported_as_ineffective() {
+        let args = SharedArgs::try_parse_from(["x", "--summary-json", "out.json", "--hierarchy"])
+            .expect("parse");
+        assert!(
+            args.ineffective_flag_warnings()
+                .iter()
+                .any(|w| w.contains("--summary-json") && w.contains("--hierarchy")),
+            "expected a warning that --summary-json is unsupported with --hierarchy"
+        );
+
+        let flat = SharedArgs::try_parse_from(["x", "--summary-json", "out.json"]).expect("parse");
+        assert!(
+            flat.ineffective_flag_warnings().is_empty(),
+            "no warning for --summary-json on the flat path"
+        );
     }
 }

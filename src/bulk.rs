@@ -30,6 +30,38 @@ pub struct ExportResult {
     pub success: bool,
     pub output_path: Option<PathBuf>,
     pub error: Option<String>,
+    /// True when an incremental run left this issue untouched (unchanged in Jira,
+    /// matching fingerprint). Distinguishes a skip from a fresh (re)export.
+    pub skipped: bool,
+}
+
+/// Machine-readable summary of a bulk/query run, for programmatic consumers.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct RunSummary {
+    pub reexported: Vec<String>,
+    pub skipped: Vec<String>,
+    pub failed: Vec<String>,
+}
+
+impl RunSummary {
+    /// Bucket export results into reexported / skipped / failed issue keys.
+    pub fn from_results<'a>(results: impl IntoIterator<Item = &'a ExportResult>) -> Self {
+        let mut summary = RunSummary::default();
+        for r in results {
+            if !r.success {
+                summary.failed.push(r.issue_key.clone());
+            } else if r.skipped {
+                summary.skipped.push(r.issue_key.clone());
+            } else {
+                summary.reexported.push(r.issue_key.clone());
+            }
+        }
+        summary
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
+    }
 }
 
 struct BulkTaskOutcome {
@@ -138,6 +170,16 @@ impl BulkExporter {
         self
     }
 
+    /// Whether this run should read/merge/write the manifest.
+    ///
+    /// An explicit `--manifest PATH` persists the manifest on its own (priming a
+    /// cache for a later `--incremental` pull); `--incremental` also writes, to
+    /// the default path when no explicit one is given. A plain export with
+    /// neither flag writes nothing, so we never litter a default manifest.
+    fn should_write_manifest(&self) -> bool {
+        self.manifest_path.is_some() || self.incremental
+    }
+
     /// Export multiple issues concurrently with semaphore-limited concurrency.
     pub async fn export_bulk(
         &self,
@@ -154,7 +196,7 @@ impl BulkExporter {
             .manifest_path
             .clone()
             .unwrap_or_else(|| default_manifest_path(&self.output_dir));
-        let manifest = if self.incremental {
+        let manifest = if self.should_write_manifest() {
             match Manifest::load_from_path(&manifest_path) {
                 Ok(manifest) => {
                     manifest.warn_legacy_issue_directories(&self.output_dir);
@@ -168,6 +210,7 @@ impl BulkExporter {
                             success: false,
                             output_path: None,
                             error: Some(e.to_string()),
+                            skipped: false,
                         })
                         .collect();
                     return (Vec::new(), failures);
@@ -249,11 +292,17 @@ impl BulkExporter {
                                 let normalized_key = normalize_issue_key(&key);
                                 if let Some(validated) = validation.get(&normalized_key) {
                                     let path = output_dir.join(&normalized_key);
+                                    // Both unchanged paths below (Skip and the
+                                    // changelog-only backfill) leave the issue's
+                                    // payload untouched in Jira terms, so a
+                                    // consumer needs to take no action — bucket
+                                    // them as skipped.
                                     let unchanged = ExportResult {
                                         issue_key: normalized_key.clone(),
                                         success: true,
                                         output_path: Some(path.clone()),
                                         error: None,
+                                        skipped: true,
                                     };
                                     match freshness::plan_metadata(
                                         &normalized_key,
@@ -330,6 +379,9 @@ impl BulkExporter {
                                             success: true,
                                             output_path: Some(output_dir.join(&normalized_key)),
                                             error: None,
+                                            // Evicted from the manifest (gone from Jira);
+                                            // nothing was re-exported this run.
+                                            skipped: true,
                                         },
                                         manifest_update: Some(ManifestUpdate::Evicted {
                                             issue_key: normalized_key,
@@ -367,6 +419,7 @@ impl BulkExporter {
                                 success: true,
                                 output_path: Some(path),
                                 error: None,
+                                skipped: false,
                             }
                             .into(),
                             Err(e) if forced_evicted_entry => BulkTaskOutcome {
@@ -379,6 +432,7 @@ impl BulkExporter {
                                         EvictionReason::FORCE_FETCH_FAILED,
                                         e
                                     )),
+                                    skipped: false,
                                 },
                                 manifest_update: Some(ManifestUpdate::Evicted {
                                     issue_key: key,
@@ -390,6 +444,7 @@ impl BulkExporter {
                                 success: false,
                                 output_path: None,
                                 error: Some(e.to_string()),
+                                skipped: false,
                             }
                             .into(),
                         }
@@ -412,7 +467,7 @@ impl BulkExporter {
         }
 
         // Update manifest with successful exports
-        if self.incremental {
+        if self.should_write_manifest() {
             let mut manifest = manifest.unwrap_or_default();
             for outcome in &outcomes {
                 if let Some(update) = &outcome.manifest_update {
@@ -616,6 +671,7 @@ where
                 success: false,
                 output_path: None,
                 error: Some(format!("timed out after {}s", timeout.as_secs())),
+                skipped: false,
             },
             manifest_update: None,
         },
@@ -758,6 +814,103 @@ mod tests {
         assert_eq!(entry.issue_type.as_deref(), Some("Task"));
         assert_eq!(entry.status.as_deref(), Some("Open"));
         assert_eq!(entry.artifact_paths[0].path, "K1");
+
+        std::fs::remove_dir_all(&output_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn bulk_export_writes_explicit_manifest_without_incremental() {
+        let updated_ts = "2024-05-01T12:00:00.000+0000";
+        let server = BackfillServer::start(updated_ts);
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let output_dir = unique_temp_dir("jarkdown-explicit-manifest-noninc");
+        let manifest_path = output_dir.join("cache").join("state.json");
+
+        let exporter = BulkExporter::new(
+            client,
+            /* concurrency */ 1,
+            Some(output_dir.to_str().unwrap()),
+            None,
+            false,
+            None,
+            None,
+            false,
+            0,
+            /* incremental */ false,
+            /* force */ false,
+        )
+        .with_manifest_path(Some(manifest_path.to_str().unwrap()))
+        .with_no_attachments(true);
+
+        let (successes, failures) = exporter.export_bulk(&["K1".to_string()]).await;
+        assert_eq!(failures.len(), 0, "no failures expected");
+        assert_eq!(successes.len(), 1);
+
+        assert!(
+            manifest_path.exists(),
+            "explicit --manifest should be written even without --incremental"
+        );
+        // The default manifest must NOT be littered into the output dir.
+        assert!(!output_dir.join(".jarkdown-manifest.json").exists());
+
+        let manifest = Manifest::load_from_path(&manifest_path).expect("manifest");
+        let entry = manifest.get("K1").expect("K1 manifest entry");
+        assert_eq!(entry.artifact_paths[0].path, "K1");
+
+        std::fs::remove_dir_all(&output_dir).ok();
+    }
+
+    #[test]
+    fn run_summary_serializes_to_json_with_all_buckets() {
+        let summary = RunSummary {
+            reexported: vec!["A".to_string()],
+            skipped: vec!["B".to_string()],
+            failed: vec!["C".to_string()],
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&summary.to_json()).expect("valid JSON");
+        assert_eq!(parsed["reexported"][0], "A");
+        assert_eq!(parsed["skipped"][0], "B");
+        assert_eq!(parsed["failed"][0], "C");
+    }
+
+    #[tokio::test]
+    async fn run_summary_buckets_reexported_then_skipped_across_runs() {
+        let updated_ts = "2024-05-01T12:00:00.000+0000";
+        let server = BackfillServer::start(updated_ts);
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let output_dir = unique_temp_dir("jarkdown-run-summary");
+        let manifest_path = output_dir.join("state.json");
+
+        let exporter = BulkExporter::new(
+            client,
+            /* concurrency */ 1,
+            Some(output_dir.to_str().unwrap()),
+            None,
+            false,
+            None,
+            None,
+            false,
+            0,
+            /* incremental */ true,
+            /* force */ false,
+        )
+        .with_manifest_path(Some(manifest_path.to_str().unwrap()))
+        .with_no_attachments(true);
+
+        // Cold run: nothing cached yet, so K1 is a full (re)export.
+        let (s1, f1) = exporter.export_bulk(&["K1".to_string()]).await;
+        let summary1 = RunSummary::from_results(s1.iter().chain(f1.iter()));
+        assert_eq!(summary1.reexported, vec!["K1".to_string()]);
+        assert!(summary1.skipped.is_empty());
+        assert!(summary1.failed.is_empty());
+
+        // Warm run: unchanged in Jira and fingerprint matches, so K1 is skipped.
+        let (s2, f2) = exporter.export_bulk(&["K1".to_string()]).await;
+        let summary2 = RunSummary::from_results(s2.iter().chain(f2.iter()));
+        assert_eq!(summary2.skipped, vec!["K1".to_string()]);
+        assert!(summary2.reexported.is_empty());
+        assert!(summary2.failed.is_empty());
 
         std::fs::remove_dir_all(&output_dir).ok();
     }
@@ -1222,6 +1375,7 @@ mod tests {
                 success: true,
                 output_path: None,
                 error: None,
+                skipped: false,
             }
             .into()
         })
@@ -1239,12 +1393,14 @@ mod tests {
             success: true,
             output_path: None,
             error: None,
+            skipped: false,
         };
         let failure = ExportResult {
             issue_key: "K2".to_string(),
             success: false,
             output_path: None,
             error: Some("boom".to_string()),
+            skipped: false,
         };
 
         assert_eq!(finish_message(1, 2, &success), "Finished 1/2... (K1)");

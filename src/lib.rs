@@ -45,7 +45,7 @@ pub mod retry;
 
 // Re-export key types for library consumers
 pub use attachment::DownloadedAttachment;
-pub use bulk::{BulkExporter, ExportResult};
+pub use bulk::{BulkExporter, ExportResult, RunSummary};
 pub use config::{ConfigManager, FieldFilter};
 pub use error::{JarkdownError, Result};
 pub use export::{perform_export, perform_export_with_options, ExportWorkflowOptions};
