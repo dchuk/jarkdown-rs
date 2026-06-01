@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.8.0 - 2026-06-01
+
+Incremental-export ergonomics for flat `bulk`/`query` (#48).
+
+### Added
+
+- `--manifest <PATH>` now persists the manifest on its own, without requiring
+  `--incremental`, so a plain `bulk KEY --manifest m.json` primes the cache for
+  a later incremental pull. Plain exports with neither flag still write nothing.
+- `--summary-json <PATH>` writes a machine-readable run summary
+  (`{"reexported": [...], "skipped": [...], "failed": [...]}`) for flat
+  `bulk`/`query`, letting programmatic consumers re-pull only what changed.
+- Stderr warnings for flags that have no effect in the current invocation
+  (`--force` without `--incremental`; `--summary-json` with `--hierarchy`),
+  emitted by `export`, `bulk`, and `query` — no more silent no-ops.
+
+### Fixed
+
+- Unchanged issues whose only work was a changelog backfill are now reported as
+  `skipped` rather than `reexported` in the run summary.
+- `--summary-json` creates missing parent directories before writing, matching
+  the index and manifest writers.
+
 ## 1.7.2 - 2026-05-27
 
 Cache-correctness patch release.
