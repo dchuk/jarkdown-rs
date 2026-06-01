@@ -191,6 +191,33 @@ fn print_summary(successes: &[jarkdown::ExportResult], failures: &[jarkdown::Exp
     }
 }
 
+/// Print a stderr warning for each flag that has no effect in this invocation.
+fn warn_ineffective_flags(shared: &jarkdown::cli::SharedArgs) {
+    for warning in shared.ineffective_flag_warnings() {
+        eprintln!("Warning: {}", warning);
+    }
+}
+
+/// Write a machine-readable run summary to `path` when `--summary-json` is set.
+fn write_summary_json(path: Option<&str>, results: &[jarkdown::ExportResult]) {
+    let Some(path) = path else { return };
+    let summary = jarkdown::RunSummary::from_results(results.iter());
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!(
+                    "Warning: Failed to create directory for summary JSON {}: {}",
+                    path, e
+                );
+                return;
+            }
+        }
+    }
+    if let Err(e) = std::fs::write(path, summary.to_json()) {
+        eprintln!("Warning: Failed to write summary JSON to {}: {}", path, e);
+    }
+}
+
 fn init_logging(verbose: bool) {
     env_logger::Builder::new()
         .filter_level(if verbose {
@@ -205,6 +232,7 @@ fn init_logging(verbose: bool) {
 
 async fn handle_export(args: jarkdown::cli::ExportArgs) {
     init_logging(args.shared.verbose);
+    warn_ineffective_flags(&args.shared);
 
     let (domain, email, api_token) = load_credentials();
     let client = match JiraApiClient::new(&domain, &email, &api_token) {
@@ -447,6 +475,7 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
 
 async fn handle_bulk(args: jarkdown::cli::BulkArgs) {
     init_logging(args.shared.verbose);
+    warn_ineffective_flags(&args.shared);
 
     let (domain, email, api_token) = load_credentials();
     let client = match JiraApiClient::new(&domain, &email, &api_token) {
@@ -515,6 +544,7 @@ async fn handle_bulk(args: jarkdown::cli::BulkArgs) {
     if let Err(e) = exporter.write_index_md(&all_results, &HashMap::new()).await {
         eprintln!("Warning: Failed to write index.md: {}", e);
     }
+    write_summary_json(args.shared.summary_json.as_deref(), &all_results);
     print_summary(&successes, &failures);
     if !failures.is_empty() {
         process::exit(1);
@@ -523,6 +553,7 @@ async fn handle_bulk(args: jarkdown::cli::BulkArgs) {
 
 async fn handle_query(args: jarkdown::cli::QueryArgs) {
     init_logging(args.shared.verbose);
+    warn_ineffective_flags(&args.shared);
 
     let (domain, email, api_token) = load_credentials();
     let client = match JiraApiClient::new(&domain, &email, &api_token) {
@@ -622,6 +653,7 @@ async fn handle_query(args: jarkdown::cli::QueryArgs) {
     if let Err(e) = exporter.write_index_md(&all_results, &issues_data).await {
         eprintln!("Warning: Failed to write index.md: {}", e);
     }
+    write_summary_json(args.shared.summary_json.as_deref(), &all_results);
     print_summary(&successes, &failures);
     if !failures.is_empty() {
         process::exit(1);
@@ -704,6 +736,7 @@ async fn run_hierarchy_export_with_validation(
                     success: true,
                     output_path: Some(output_dir.join(issue_key)),
                     error: None,
+                    skipped: true,
                 };
             }
             Ok(None) => {}
@@ -735,6 +768,7 @@ async fn run_hierarchy_export_with_validation(
                 success: false,
                 output_path: None,
                 error: Some(error),
+                skipped: false,
             }
         }
         Ok(Ok(tree)) => {
@@ -767,6 +801,7 @@ async fn run_hierarchy_export_with_validation(
                 success: true,
                 output_path: Some(output_dir.join(issue_key)),
                 error: None,
+                skipped: false,
             }
         }
         Ok(Err(e)) => {
@@ -776,6 +811,7 @@ async fn run_hierarchy_export_with_validation(
                 success: false,
                 output_path: None,
                 error: Some(e.to_string()),
+                skipped: false,
             }
         }
     }
@@ -1369,6 +1405,48 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    #[test]
+    fn write_summary_json_creates_missing_parent_directories() {
+        let base = std::env::temp_dir().join(format!(
+            "jarkdown-summary-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let target = base.join("nested").join("summary.json");
+
+        let results = vec![
+            jarkdown::ExportResult {
+                issue_key: "K1".to_string(),
+                success: true,
+                output_path: None,
+                error: None,
+                skipped: false,
+            },
+            jarkdown::ExportResult {
+                issue_key: "K2".to_string(),
+                success: true,
+                output_path: None,
+                error: None,
+                skipped: true,
+            },
+        ];
+
+        write_summary_json(Some(target.to_str().unwrap()), &results);
+
+        assert!(
+            target.exists(),
+            "summary file should be created in a new dir"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).expect("valid JSON");
+        assert_eq!(parsed["reexported"][0], "K1");
+        assert_eq!(parsed["skipped"][0], "K2");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
 
     #[test]
     fn issue_keys_from_search_results_extracts_one_key_per_matching_issue() {
@@ -2119,6 +2197,7 @@ mod tests {
             max_depth: 2,
             max_issues: 200,
             include_changelog: false,
+            summary_json: None,
         }
     }
 
