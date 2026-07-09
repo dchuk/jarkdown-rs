@@ -122,6 +122,11 @@ pub struct ManifestEntry {
     /// Display workflow status from Jira.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// Last observed JPD archived state (ADR-0005). `None` when never
+    /// observed (pre-feature entries, non-JPD sites), which freshness
+    /// planning treats as "not archived".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived: Option<bool>,
     /// Whether this Issue is active or retained as an Evicted Issue tombstone.
     pub state: IssueCacheState,
     /// Coarse eviction reason when `state` is `evicted`.
@@ -401,6 +406,7 @@ impl Manifest {
                 summary: None,
                 issue_type: None,
                 status: None,
+                archived: None,
                 state: IssueCacheState::Active,
                 eviction_reason: None,
                 artifact_paths: vec![ArtifactPath {
@@ -484,6 +490,8 @@ impl Manifest {
             .get(&key)
             .map(|entry| (entry.requested_roots.clone(), entry.hierarchy_roots.clone()))
             .unwrap_or_default();
+        // Preserved like the roots above; refreshed separately via `set_archived`.
+        let archived = self.issues.get(&key).and_then(|entry| entry.archived);
         self.issues.insert(
             key.clone(),
             ManifestEntry {
@@ -492,6 +500,7 @@ impl Manifest {
                 summary: summary.map(str::to_string),
                 issue_type: issue_type.map(str::to_string),
                 status: status.map(str::to_string),
+                archived,
                 state: IssueCacheState::Active,
                 eviction_reason: None,
                 artifact_paths: existing_artifacts,
@@ -506,6 +515,24 @@ impl Manifest {
     /// Return the normalized entry for an Issue key.
     pub fn get(&self, issue_key: &str) -> Option<&ManifestEntry> {
         self.issues.get(&normalize_issue_key(issue_key))
+    }
+
+    /// Record the observed JPD archived state for an existing entry.
+    ///
+    /// `None` means "not observed this run" and leaves the stored state
+    /// untouched, so runs without archived visibility (no resolved field id)
+    /// never erase a previously observed state.
+    pub fn set_archived(&mut self, issue_key: &str, archived: Option<bool>) {
+        let Some(observed) = archived else {
+            return;
+        };
+        let key = normalize_issue_key(issue_key);
+        if let Some(entry) = self.issues.get_mut(&key) {
+            if entry.archived != Some(observed) {
+                entry.archived = Some(observed);
+                self.touched_issues.insert(key);
+            }
+        }
     }
 
     /// Return true when an Issue has an active cache entry.
@@ -822,6 +849,8 @@ impl Manifest {
             .get(&key)
             .map(|entry| (entry.requested_roots.clone(), entry.hierarchy_roots.clone()))
             .unwrap_or_default();
+        // Preserved like the roots above; refreshed separately via `set_archived`.
+        let archived = self.issues.get(&key).and_then(|entry| entry.archived);
         self.issues.insert(
             key.clone(),
             ManifestEntry {
@@ -830,6 +859,7 @@ impl Manifest {
                 summary: summary.map(str::to_string),
                 issue_type: issue_type.map(str::to_string),
                 status: status.map(str::to_string),
+                archived,
                 state: IssueCacheState::Active,
                 eviction_reason: None,
                 artifact_paths: existing_artifacts,
@@ -1427,6 +1457,7 @@ fn migrate_v1(value: serde_json::Value) -> Result<Manifest> {
                     summary: None,
                     issue_type: None,
                     status: None,
+                    archived: None,
                     state: IssueCacheState::Active,
                     eviction_reason: None,
                     artifact_paths: vec![ArtifactPath {
@@ -1575,6 +1606,59 @@ mod tests {
             !dir.join("A.hierarchy.md").exists(),
             "loading a legacy nested snapshot must not migrate files"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A pre-ADR-0005 v2 manifest (no `archived` key on entries) loads with
+    /// `archived: None` — no migration, no error — and the key stays absent
+    /// on save until a state is actually observed. `set_archived` overwrites
+    /// observed states, ignores unobserved runs (`None`), and no-ops for
+    /// unknown keys.
+    #[test]
+    fn manifest_without_archived_field_loads_and_set_archived_updates_it() {
+        let dir = temp_dir("archived-compat");
+        let path = default_manifest_path(&dir);
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 2,
+                "issues": {
+                    "PSOP-1": {
+                        "updated": "2026-01-01T00:00:00.000+0000",
+                        "exported_at": "2026-01-02T00:00:00Z",
+                        "state": "active",
+                        "artifact_paths": [{"path": "PSOP-1", "active": true}]
+                    }
+                },
+                "edges": []
+            }"#,
+        )
+        .unwrap();
+
+        let mut manifest = Manifest::load_from_path(&path).unwrap();
+        assert_eq!(manifest.get("PSOP-1").unwrap().archived, None);
+
+        // Unobserved run leaves the stored state alone; unknown keys no-op.
+        manifest.set_archived("PSOP-1", None);
+        assert_eq!(manifest.get("PSOP-1").unwrap().archived, None);
+        manifest.set_archived("PSOP-999", Some(true));
+
+        manifest.save_to_path(&path).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            saved["issues"]["PSOP-1"].get("archived").is_none(),
+            "unobserved state must not serialize an archived key"
+        );
+
+        // An observed state round-trips.
+        manifest.set_archived("psop-1", Some(true));
+        assert_eq!(manifest.get("PSOP-1").unwrap().archived, Some(true));
+        manifest.save_to_path(&path).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["issues"]["PSOP-1"]["archived"], json!(true));
 
         std::fs::remove_dir_all(&dir).ok();
     }

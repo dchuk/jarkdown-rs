@@ -32,6 +32,10 @@ pub struct PlanOptions<'a> {
     pub include_json: bool,
     pub option_fingerprint: Option<&'a str>,
     pub option_fingerprint_without_changelog: Option<&'a str>,
+    /// JPD archived state observed this run (`None` = not observed). ADR-0005:
+    /// drift against the manifest forces a full export even when `updated`
+    /// has not moved, so the frontmatter marker never goes stale.
+    pub archived: Option<bool>,
 }
 
 /// Decide what an incremental export should do for `issue`.
@@ -53,6 +57,7 @@ pub fn plan(
             include_json: false,
             option_fingerprint: None,
             option_fingerprint_without_changelog: None,
+            archived: None,
         },
         issue_dir,
     )
@@ -69,6 +74,15 @@ pub fn plan_metadata(
     let entry = manifest.get(issue_key);
     if manifest.is_stale(issue_key, updated) {
         return ExportPlan::Full;
+    }
+    // ADR-0005 belt-and-braces: archived-state drift forces a full export
+    // regardless of `updated`. A stored `None` counts as "not archived" so
+    // pre-feature manifest entries don't churn when `Some(false)` is observed.
+    if let Some(observed) = options.archived {
+        let stored = entry.and_then(|entry| entry.archived).unwrap_or(false);
+        if observed != stored {
+            return ExportPlan::Full;
+        }
     }
     let stored_fingerprint = entry.and_then(|entry| entry.option_fingerprint.as_deref());
     if stored_fingerprint != options.option_fingerprint {
@@ -197,6 +211,46 @@ mod tests {
             ),
             ExportPlan::Full
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Belt-and-braces from ADR-0005: an Idea archived (or restored) since the
+    /// last export is re-exported even when `updated` has not moved, so the
+    /// frontmatter marker never goes stale. A stored `None` (pre-feature
+    /// manifest) counts as "not archived" — observing `Some(false)` must NOT
+    /// churn every old entry into a full export.
+    #[test]
+    fn archived_state_drift_is_full_even_when_updated_is_unchanged() {
+        let dir = temp_dir("archived-drift");
+        std::fs::write(dir.join("K1.md"), "x").unwrap();
+        let mut m = Manifest::default();
+        m.record("K1", TS);
+
+        let plan_with = |m: &Manifest, archived: Option<bool>| {
+            plan_metadata(
+                "K1",
+                TS,
+                m,
+                PlanOptions {
+                    archived,
+                    ..PlanOptions::default()
+                },
+                &dir,
+            )
+        };
+
+        // Stored: not archived (None). Observed archived → Full.
+        assert_eq!(plan_with(&m, Some(true)), ExportPlan::Full);
+        // Observed live / unobserved → no churn.
+        assert_eq!(plan_with(&m, Some(false)), ExportPlan::Skip);
+        assert_eq!(plan_with(&m, None), ExportPlan::Skip);
+
+        // Stored: archived. Observed live (restored) → Full; still archived → Skip.
+        m.set_archived("K1", Some(true));
+        assert_eq!(plan_with(&m, Some(false)), ExportPlan::Full);
+        assert_eq!(plan_with(&m, Some(true)), ExportPlan::Skip);
+        assert_eq!(plan_with(&m, None), ExportPlan::Skip);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

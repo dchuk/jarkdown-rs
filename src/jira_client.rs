@@ -20,6 +20,10 @@ pub struct ValidationIssue {
     pub summary: Option<String>,
     pub issue_type: Option<String>,
     pub status: Option<String>,
+    /// JPD archived state, observed only when the caller supplied the site's
+    /// resolved "Idea archived" field id: `Some(true)` = archived,
+    /// `Some(false)` = live, `None` = not observed this run.
+    pub archived: Option<bool>,
 }
 
 /// Handles all communication with the Jira Cloud REST API.
@@ -187,7 +191,15 @@ impl JiraApiClient {
     }
 
     /// Validate Issue freshness through Jira search using only cache metadata fields.
-    pub async fn validate_issue_keys(&self, issue_keys: &[String]) -> Result<Vec<ValidationIssue>> {
+    ///
+    /// `archived_field_id` is the site's resolved "Idea archived"
+    /// `customfield_*` id; when supplied, the field is fetched too and each
+    /// [`ValidationIssue`] reports its observed archived state.
+    pub async fn validate_issue_keys(
+        &self,
+        issue_keys: &[String],
+        archived_field_id: Option<&str>,
+    ) -> Result<Vec<ValidationIssue>> {
         let mut keys: Vec<String> = issue_keys
             .iter()
             .map(|key| key.trim().to_ascii_uppercase())
@@ -204,10 +216,15 @@ impl JiraApiClient {
             let requested_keys: std::collections::HashSet<String> = chunk.iter().cloned().collect();
 
             for page_number in 0..VALIDATION_MAX_PAGES_PER_CHUNK {
+                let mut fields = String::from("updated,summary,issuetype,status");
+                if let Some(field_id) = archived_field_id {
+                    fields.push(',');
+                    fields.push_str(field_id);
+                }
                 let mut query_params: Vec<(String, String)> = vec![
                     ("jql".into(), jql.clone()),
                     ("maxResults".into(), VALIDATION_PAGE_SIZE.to_string()),
-                    ("fields".into(), "updated,summary,issuetype,status".into()),
+                    ("fields".into(), fields),
                 ];
                 if let Some(ref token) = next_page_token {
                     query_params.push(("nextPageToken".into(), token.clone()));
@@ -220,7 +237,7 @@ impl JiraApiClient {
                 let page_empty = page_issues.is_empty();
                 for issue in page_issues
                     .into_iter()
-                    .filter_map(validation_issue_from_value)
+                    .filter_map(|value| validation_issue_from_value(value, archived_field_id))
                 {
                     if requested_keys.contains(&issue.key) {
                         seen_keys.insert(issue.key.clone());
@@ -303,7 +320,10 @@ fn validation_jql(keys: &[String]) -> String {
     format!("key in ({})", quoted)
 }
 
-fn validation_issue_from_value(value: Value) -> Option<ValidationIssue> {
+fn validation_issue_from_value(
+    value: Value,
+    archived_field_id: Option<&str>,
+) -> Option<ValidationIssue> {
     let key = value["key"].as_str()?.trim().to_ascii_uppercase();
     if key.is_empty() {
         return None;
@@ -315,6 +335,10 @@ fn validation_issue_from_value(value: Value) -> Option<ValidationIssue> {
         summary: fields["summary"].as_str().map(str::to_string),
         issue_type: fields["issuetype"]["name"].as_str().map(str::to_string),
         status: fields["status"]["name"].as_str().map(str::to_string),
+        // The field was requested, so the state was observed: a null/absent
+        // value means "not archived", not "unknown".
+        archived: archived_field_id
+            .map(|field_id| crate::issue::archived_value_is_yes(&fields[field_id])),
     })
 }
 
@@ -401,7 +425,7 @@ mod tests {
         let keys: Vec<String> = (1..=51).map(|n| format!("proj-{}", n)).collect();
 
         let results = client
-            .validate_issue_keys(&keys)
+            .validate_issue_keys(&keys, None)
             .await
             .expect("validate issue keys");
 
@@ -440,7 +464,7 @@ mod tests {
         let keys = vec!["PROJ-1".to_string(), "PROJ-2".to_string()];
 
         let results = client
-            .validate_issue_keys(&keys)
+            .validate_issue_keys(&keys, None)
             .await
             .expect("validate issue keys");
 
@@ -466,7 +490,7 @@ mod tests {
         let keys = vec!["PROJ-1".to_string(), "PROJ-2".to_string()];
 
         let results = client
-            .validate_issue_keys(&keys)
+            .validate_issue_keys(&keys, None)
             .await
             .expect("validate issue keys");
 
@@ -482,6 +506,53 @@ mod tests {
         );
     }
 
+    /// When a resolved "Idea archived" field id is supplied, validation
+    /// requests it alongside the metadata fields and reports each issue's
+    /// archived state: `Yes` → `Some(true)`, empty/null → `Some(false)`.
+    /// Without a field id the state is unobserved (`None`).
+    #[tokio::test]
+    async fn validate_issue_keys_reports_archived_state_when_field_id_supplied() {
+        let page = r#"{"issues":[
+            {"key":"PSOP-1","fields":{"updated":"2026-01-01T00:00:00.000+0000","customfield_99001":{"value":"Yes"}}},
+            {"key":"PSOP-2","fields":{"updated":"2026-01-02T00:00:00.000+0000","customfield_99001":null}}
+        ]}"#;
+        let server = ValidationSequenceServer::start(vec![page]);
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let keys = vec!["PSOP-1".to_string(), "PSOP-2".to_string()];
+
+        let results = client
+            .validate_issue_keys(&keys, Some("customfield_99001"))
+            .await
+            .expect("validate issue keys");
+
+        let archived_of = |key: &str| {
+            results
+                .iter()
+                .find(|issue| issue.key == key)
+                .unwrap()
+                .archived
+        };
+        assert_eq!(archived_of("PSOP-1"), Some(true));
+        assert_eq!(archived_of("PSOP-2"), Some(false));
+        assert!(
+            server
+                .observed_paths()
+                .iter()
+                .all(|path| path.contains("customfield_99001")),
+            "archived field id should be requested: {:?}",
+            server.observed_paths()
+        );
+
+        // Without a field id, archived state is unobserved.
+        let server = ValidationSequenceServer::start(vec![page]);
+        let client = JiraApiClient::new_for_test(&server.base_url);
+        let results = client
+            .validate_issue_keys(&keys, None)
+            .await
+            .expect("validate issue keys");
+        assert!(results.iter().all(|issue| issue.archived.is_none()));
+    }
+
     #[tokio::test]
     async fn validate_issue_keys_errors_after_max_pages_per_chunk() {
         let server = ValidationSequenceServer::start(vec![
@@ -491,7 +562,7 @@ mod tests {
         let keys = vec!["PROJ-1".to_string()];
 
         let err = client
-            .validate_issue_keys(&keys)
+            .validate_issue_keys(&keys, None)
             .await
             .expect_err("validation should fail after max pages");
         let message = err.to_string();
