@@ -380,6 +380,7 @@ mod tests {
                         summary: None,
                         issue_type: None,
                         status: None,
+                        archived: None,
                     },
                 )
             })

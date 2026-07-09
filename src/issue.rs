@@ -14,9 +14,54 @@
 //! field degrades to an empty default — Jira omits fields legitimately
 //! (e.g. `updated` on some projections) and that is not schema drift.
 
+use std::collections::HashMap;
+
 use serde_json::Value;
 
 use crate::error::{JarkdownError, Result};
+
+/// Display names of the JPD archiving fields (locked custom fields whose
+/// `customfield_*` ids differ per site — always resolve by name).
+pub const IDEA_ARCHIVED_FIELD: &str = "Idea archived";
+pub const IDEA_ARCHIVED_BY_FIELD: &str = "Idea archived by";
+pub const IDEA_ARCHIVED_ON_FIELD: &str = "Idea archived on";
+
+/// All three JPD archiving field names, for suppressing them from the
+/// `## Custom Fields` section once they are promoted to frontmatter.
+pub const IDEA_ARCHIVED_FIELDS: [&str; 3] = [
+    IDEA_ARCHIVED_FIELD,
+    IDEA_ARCHIVED_BY_FIELD,
+    IDEA_ARCHIVED_ON_FIELD,
+];
+
+/// JPD archived state resolved from an Archived Idea's raw fields.
+///
+/// Exists only for archived Ideas — a live Idea (or any non-JPD issue) has no
+/// `ArchivedInfo` at all, mirroring the frontmatter contract (ADR-0005): the
+/// keys are emitted only when archived.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArchivedInfo {
+    /// "Idea archived on" date, when Jira returned it.
+    pub archived_on: Option<String>,
+    /// "Idea archived by" user display name, when Jira returned it.
+    pub archived_by: Option<String>,
+}
+
+/// Whether a raw "Idea archived" field value means archived.
+///
+/// The field holds `Yes` or empty; the exact JSON shape is not pinned by
+/// Atlassian docs, so accept the option-object shape (`{"value": "Yes"}`), a
+/// plain string, or a boolean.
+pub fn archived_value_is_yes(value: &Value) -> bool {
+    match value {
+        Value::Bool(b) => *b,
+        Value::String(s) => s.eq_ignore_ascii_case("yes"),
+        Value::Object(_) => value["value"]
+            .as_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case("yes")),
+        _ => false,
+    }
+}
 
 /// Rich-text content for a description or comment body.
 ///
@@ -648,6 +693,41 @@ impl Issue {
             .get("fields")
             .and_then(|f| f.get(name))
             .filter(|v| !v.is_null())
+    }
+
+    /// Resolve this issue's JPD archived state ([`ArchivedInfo`]) from a
+    /// `customfield_* id → display name` map (the shape
+    /// `CustomFieldMetadata.names` carries).
+    ///
+    /// Returns `Some` only when the "Idea archived" field resolves and its
+    /// value means archived; a live Idea, a non-JPD issue, or a site without
+    /// the field all yield `None`.
+    pub fn archived_info(&self, field_names: &HashMap<String, String>) -> Option<ArchivedInfo> {
+        let id_for = |name: &str| {
+            field_names
+                .iter()
+                .find(|(_, display)| display.as_str() == name)
+                .map(|(id, _)| id.as_str())
+        };
+        let archived_value = self.field(id_for(IDEA_ARCHIVED_FIELD)?)?;
+        if !archived_value_is_yes(archived_value) {
+            return None;
+        }
+        let archived_on = id_for(IDEA_ARCHIVED_ON_FIELD)
+            .and_then(|id| self.field(id))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        // A user field is normally an object with `displayName`; tolerate a
+        // plain string for the same shape-uncertainty reasons as
+        // `archived_value_is_yes`.
+        let archived_by = id_for(IDEA_ARCHIVED_BY_FIELD)
+            .and_then(|id| self.field(id))
+            .and_then(|v| v["displayName"].as_str().or_else(|| v.as_str()))
+            .map(str::to_string);
+        Some(ArchivedInfo {
+            archived_on,
+            archived_by,
+        })
     }
 }
 

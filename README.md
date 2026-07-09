@@ -468,6 +468,50 @@ legacy nested tree; nested and corpus layouts both write root snapshots as
 layout for better shared-cache behavior. Use `--hierarchy-layout nested` or
 `--hierarchy-layout corpus` to choose explicitly.
 
+### Archived ideas
+
+JPD archiving is a locked custom field ("Idea archived": empty or `Yes`), not
+a Jira status. JPD views in the UI always hide archived ideas, but JQL/REST
+search returns them by default — so a project-wide query can return **more**
+issues than the JPD view shows (e.g. the API returns 75 ideas while the view
+shows 50). That gap is archived ideas.
+
+jarkdown never rewrites your JQL. Instead, exported frontmatter marks each
+archived idea:
+
+```yaml
+archived: true
+archived_on: 2026-06-12
+archived_by: Priya Patel
+```
+
+Live ideas (and non-JPD issues) carry none of these keys — absence means "not
+archived". The recommended sync recipe is therefore to query the **whole
+project** and let consumers filter on the `archived` frontmatter key:
+
+```bash
+# Living mirror: archived ideas stay in the folder, marked in frontmatter.
+# Archiving an idea re-exports it with the marker on the next incremental run.
+jarkdown-rs query "project = PSOP" --incremental --manifest .jarkdown-manifest.json
+```
+
+Excluding archived ideas in JQL also works when you want UI-equivalent result
+sets, at a cost: an idea archived *after* its first export drops out of the
+query and its exported file silently goes stale.
+
+```bash
+# Match what the JPD view shows (archived hidden)
+jarkdown-rs query 'project = PSOP AND "Idea archived" IS EMPTY'
+
+# Only archived ideas
+jarkdown-rs query 'project = PSOP AND "Idea archived" = Yes'
+```
+
+The archiving fields' `customfield_*` ids differ per site; jarkdown resolves
+them by display name from the cached field metadata (refresh with
+`--refresh-fields` if archived state is missing from exports). See
+`docs/adr/0005-archived-ideas-are-marked-not-filtered.md` for the full design.
+
 ## Requirements
 
 - **Rust 2021 edition** (for building from source)

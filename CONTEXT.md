@@ -12,6 +12,21 @@ decisions, see [`docs/adr/`](docs/adr/).
 A single Jira ticket, identified by its key (e.g. `PROJ-123`).
 _Avoid_: Ticket, story (use these only when referring to a specific Jira issue type).
 
+**Idea**:
+An **Issue** that belongs to a Jira Product Discovery (JPD) project. Ideas are
+ordinary Issues to the Jira REST API and may point at **Delivery Issues**
+through **Delivery Links**.
+_Avoid_: JPD ticket.
+
+**Archived Idea**:
+An **Idea** whose JPD "Idea archived" field is set (the field is either empty
+or `Yes`). Archiving hides an Idea from JPD views in the UI, but the Idea
+still exists in Jira, remains readable, and is still returned by JQL searches
+unless explicitly excluded (`"Idea archived" IS EMPTY`). Distinct from an
+**Evicted Issue**, which Jira stopped returning entirely.
+_Avoid_: Deleted idea, hidden idea, archived issue (Jira Cloud's
+enterprise issue-archiving is an unrelated mechanism).
+
 **Child Issue**:
 An **Issue** directly related beneath another **Issue** in an exported hierarchy.
 Child Issues may come from Jira sub-tasks, epic membership, JPD delivery links,
@@ -78,6 +93,8 @@ A time-tracking entry logged against an **Issue** (author, time spent, date, opt
   last known hierarchy edge is removed.
 - An **Evicted Issue** is inactive until it is requested directly or rediscovered
   through hierarchy traversal.
+- An **Archived Idea** remains a live **Issue** in Jira; it is never an
+  **Evicted Issue** merely because it was archived.
 
 ## Flagged ambiguities
 

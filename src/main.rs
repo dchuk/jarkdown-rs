@@ -294,7 +294,7 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
     // Incremental check for single export
     if args.shared.incremental && !args.shared.force {
         let (validation_succeeded, validation) = match client
-            .validate_issue_keys(std::slice::from_ref(&issue_key))
+            .validate_issue_keys(std::slice::from_ref(&issue_key), None)
             .await
         {
             Ok(results) => (
@@ -324,6 +324,7 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
                     option_fingerprint: option_fingerprint.as_deref(),
                     option_fingerprint_without_changelog: option_fingerprint_without_changelog
                         .as_deref(),
+                    archived: issue.archived,
                 },
                 &output_path,
             ) {
@@ -837,7 +838,7 @@ async fn try_warm_corpus_hierarchy_skip(
     let validation = match validation_plan {
         Some(plan) => plan.clone(),
         None => client
-            .validate_issue_keys(&keys)
+            .validate_issue_keys(&keys, None)
             .await?
             .into_iter()
             .map(|issue| (normalize_issue_key(&issue.key), issue))
@@ -853,6 +854,9 @@ async fn try_warm_corpus_hierarchy_skip(
             include_json: shared.include_json,
             option_fingerprint,
             option_fingerprint_without_changelog,
+            // Hierarchy validation runs without the archived field id, so the
+            // state is unobserved on these paths.
+            archived: None,
         },
     });
     let (missing_keys, keys, refresh_plans) = match plan {
@@ -1033,7 +1037,7 @@ async fn try_warm_nested_hierarchy_skip(
     let validation = match validation_plan {
         Some(plan) => plan.clone(),
         None => client
-            .validate_issue_keys(&keys)
+            .validate_issue_keys(&keys, None)
             .await?
             .into_iter()
             .map(|issue| (normalize_issue_key(&issue.key), issue))
@@ -1049,6 +1053,9 @@ async fn try_warm_nested_hierarchy_skip(
             include_json: shared.include_json,
             option_fingerprint,
             option_fingerprint_without_changelog,
+            // Hierarchy validation runs without the archived field id, so the
+            // state is unobserved on these paths.
+            archived: None,
         },
     });
     let (missing_keys, refresh_plans) = match plan {
@@ -1301,7 +1308,7 @@ async fn build_hierarchy_validation_plan(
     if keys.is_empty() {
         return None;
     }
-    match client.validate_issue_keys(&keys).await {
+    match client.validate_issue_keys(&keys, None).await {
         Ok(results) => Some(
             results
                 .into_iter()

@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+JPD archived-state support (#52, ADR-0005): archived ideas are mirrored and
+marked, never filtered.
+
+### Added
+
+- Frontmatter marks JPD Archived Ideas: `archived: true` plus `archived_on` /
+  `archived_by` when the site's "Idea archived" field is `Yes`. Live ideas and
+  non-JPD issues emit none of the keys — absence means "not archived". The
+  fields are resolved by display name (per-site `customfield_*` ids).
+- Incremental runs re-export an idea whose archived state drifted from the
+  manifest even when `updated` has not moved, so the frontmatter marker never
+  goes stale. Validation observes the state when the field id is known from
+  the field cache; pre-existing manifests load unchanged.
+- README: archived-ideas section explaining the API-vs-view count gap
+  (archived ideas are returned by JQL/REST by default but hidden in JPD
+  views), the sync-all-and-filter-on-frontmatter recipe, and the
+  `"Idea archived" IS EMPTY` / `= Yes` JQL clauses.
+
+### Changed
+
+- The three "Idea archived*" fields no longer render in `## Custom Fields`
+  (they are frontmatter now).
+
 ## 1.8.0 - 2026-06-01
 
 Incremental-export ergonomics for flat `bulk`/`query` (#48).

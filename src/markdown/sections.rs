@@ -19,8 +19,30 @@ use crate::markdown::html::convert_html_to_markdown;
 use crate::markdown::RenderContext;
 
 pub(crate) fn frontmatter(ctx: &RenderContext<'_>) -> Vec<String> {
-    let metadata = generate_metadata(ctx.issue);
-    let yaml_str = serde_yaml::to_string(&metadata).unwrap_or_default();
+    let mut metadata = generate_metadata(ctx.issue);
+
+    // ADR-0005: an Archived Idea is marked in frontmatter (never filtered out
+    // of the export). The keys exist only when the issue is archived.
+    if let Some(archived) = ctx.issue.archived_info(&ctx.field_metadata.names) {
+        metadata.insert(
+            serde_yaml::Value::String("archived".into()),
+            serde_yaml::Value::Bool(true),
+        );
+        if let Some(on) = archived.archived_on {
+            metadata.insert(
+                serde_yaml::Value::String("archived_on".into()),
+                serde_yaml::Value::String(on),
+            );
+        }
+        if let Some(by) = archived.archived_by {
+            metadata.insert(
+                serde_yaml::Value::String("archived_by".into()),
+                serde_yaml::Value::String(by),
+            );
+        }
+    }
+
+    let yaml_str = serde_yaml::to_string(&serde_yaml::Value::Mapping(metadata)).unwrap_or_default();
 
     let mut lines = Vec::new();
     lines.push("---".into());
@@ -271,6 +293,12 @@ pub(crate) fn custom_fields(ctx: &RenderContext<'_>) -> Vec<String> {
             .cloned()
             .unwrap_or_else(|| key.clone());
 
+        // The JPD archiving fields are promoted to frontmatter (ADR-0005);
+        // rendering them here too would duplicate them.
+        if crate::issue::IDEA_ARCHIVED_FIELDS.contains(&display_name.as_str()) {
+            continue;
+        }
+
         // Apply field filter
         if ctx.field_filter.exclude.contains(&display_name) {
             continue;
@@ -448,7 +476,7 @@ pub(crate) fn attachments(ctx: &RenderContext<'_>) -> Vec<String> {
 /// `null`-vs-string output: `parse_string` collapses absent/null to `""`,
 /// which we surface as YAML `null`; `parse_opt_string` preserves the absent
 /// case directly.
-fn generate_metadata(issue: &Issue) -> serde_yaml::Value {
+fn generate_metadata(issue: &Issue) -> serde_yaml::Mapping {
     use serde_yaml::Value as Y;
 
     let mut map = serde_yaml::Mapping::new();
@@ -593,7 +621,7 @@ fn generate_metadata(issue: &Issue) -> serde_yaml::Value {
         Y::Number(issue.watches.watch_count.into()),
     );
 
-    Y::Mapping(map)
+    map
 }
 
 fn format_time(seconds: u64) -> String {
@@ -825,5 +853,193 @@ mod tests {
         assert!(rendered.contains("watches: 8"));
         assert!(rendered.contains("- a")); // labels
         assert!(rendered.contains("- UI")); // components
+    }
+
+    /// Render the frontmatter for a `json!()` issue payload with the given
+    /// `customfield_* → display name` mapping (the shape `CustomFieldMetadata`
+    /// carries at the export seam).
+    fn frontmatter_with_names(raw: serde_json::Value, names: &[(&str, &str)]) -> String {
+        let issue = Issue::from_value(raw).expect("fixture parses");
+        let field_metadata = CustomFieldMetadata {
+            names: names
+                .iter()
+                .map(|(id, name)| (id.to_string(), name.to_string()))
+                .collect(),
+            schemas: std::collections::HashMap::new(),
+        };
+        let field_filter = FieldFilter::default();
+        let ctx = RenderContext {
+            issue: &issue,
+            downloaded: &[],
+            skipped_attachments: &[],
+            attachments: AttachmentIndex::empty(),
+            field_metadata: &field_metadata,
+            field_filter: &field_filter,
+            child_issues: &[],
+            changelog_summary: None,
+            base_url: "https://example.atlassian.net",
+            domain: "example.atlassian.net",
+        };
+        frontmatter(&ctx).join("\n")
+    }
+
+    /// An Archived Idea (JPD "Idea archived" = Yes) is marked in frontmatter.
+    /// The field is per-site (`customfield_*` id varies), so resolution goes
+    /// through the display-name mapping, never a hardcoded id.
+    #[test]
+    fn frontmatter_marks_archived_idea() {
+        let rendered = frontmatter_with_names(
+            serde_json::json!({
+                "key": "PSOP-1",
+                "fields": {
+                    "summary": "An archived idea",
+                    "issuetype": { "name": "Idea" },
+                    "status": { "name": "Open" },
+                    "customfield_99001": { "value": "Yes" }
+                }
+            }),
+            &[("customfield_99001", "Idea archived")],
+        );
+        assert!(
+            rendered.contains("archived: true"),
+            "frontmatter should mark the Archived Idea:\n{}",
+            rendered
+        );
+    }
+
+    /// When Jira returns the companion fields, the archive date and the
+    /// archiving user's display name ride along with the marker.
+    #[test]
+    fn frontmatter_carries_archived_on_and_archived_by() {
+        let rendered = frontmatter_with_names(
+            serde_json::json!({
+                "key": "PSOP-2",
+                "fields": {
+                    "summary": "Archived with details",
+                    "issuetype": { "name": "Idea" },
+                    "status": { "name": "Open" },
+                    "customfield_99001": { "value": "Yes" },
+                    "customfield_99002": { "displayName": "Priya Patel" },
+                    "customfield_99003": "2026-06-12"
+                }
+            }),
+            &[
+                ("customfield_99001", "Idea archived"),
+                ("customfield_99002", "Idea archived by"),
+                ("customfield_99003", "Idea archived on"),
+            ],
+        );
+        assert!(rendered.contains("archived: true"), "{}", rendered);
+        assert!(rendered.contains("archived_on: 2026-06-12"), "{}", rendered);
+        assert!(
+            rendered.contains("archived_by: Priya Patel"),
+            "{}",
+            rendered
+        );
+    }
+
+    /// A live Idea ("Idea archived" empty — Jira sends `null`) and a non-JPD
+    /// issue (field not mapped at all) emit none of the archived keys, not
+    /// even `archived: false`: absence IS the not-archived signal (ADR-0005,
+    /// since the post-2025 global field exists on every issue site-wide).
+    #[test]
+    fn frontmatter_omits_archived_keys_for_live_and_non_jpd_issues() {
+        let live_idea = frontmatter_with_names(
+            serde_json::json!({
+                "key": "PSOP-3",
+                "fields": {
+                    "summary": "A live idea",
+                    "issuetype": { "name": "Idea" },
+                    "status": { "name": "Open" },
+                    "customfield_99001": null
+                }
+            }),
+            &[("customfield_99001", "Idea archived")],
+        );
+        let non_jpd = frontmatter_with_names(
+            serde_json::json!({
+                "key": "ENG-9",
+                "fields": {
+                    "summary": "A regular story",
+                    "issuetype": { "name": "Story" },
+                    "status": { "name": "Open" }
+                }
+            }),
+            &[],
+        );
+        for rendered in [live_idea, non_jpd] {
+            assert!(!rendered.contains("archived"), "{}", rendered);
+        }
+    }
+
+    /// The archiving fields' `customfield_*` ids differ per Jira site; the
+    /// same payload shape under a different id must render identically.
+    #[test]
+    fn frontmatter_resolves_archived_field_by_name_regardless_of_id() {
+        for id in ["customfield_10423", "customfield_10643"] {
+            let rendered = frontmatter_with_names(
+                serde_json::json!({
+                    "key": "PSOP-4",
+                    "fields": {
+                        "summary": "Archived on another site",
+                        "issuetype": { "name": "Idea" },
+                        "status": { "name": "Open" },
+                        (id): { "value": "Yes" }
+                    }
+                }),
+                &[(id, "Idea archived")],
+            );
+            assert!(rendered.contains("archived: true"), "{}: {}", id, rendered);
+        }
+    }
+
+    /// The three archiving fields are owned by frontmatter now — they must
+    /// not ALSO render as `## Custom Fields` entries, while unrelated custom
+    /// fields keep rendering.
+    #[test]
+    fn custom_fields_section_suppresses_archived_fields() {
+        let issue = Issue::from_value(serde_json::json!({
+            "key": "PSOP-5",
+            "fields": {
+                "summary": "Archived with other custom fields",
+                "issuetype": { "name": "Idea" },
+                "status": { "name": "Open" },
+                "customfield_99001": { "value": "Yes" },
+                "customfield_99002": { "displayName": "Priya Patel" },
+                "customfield_99003": "2026-06-12",
+                "customfield_55555": "roadmap-alpha"
+            }
+        }))
+        .expect("fixture parses");
+        let field_metadata = CustomFieldMetadata {
+            names: [
+                ("customfield_99001", "Idea archived"),
+                ("customfield_99002", "Idea archived by"),
+                ("customfield_99003", "Idea archived on"),
+                ("customfield_55555", "Roadmap"),
+            ]
+            .iter()
+            .map(|(id, name)| (id.to_string(), name.to_string()))
+            .collect(),
+            schemas: std::collections::HashMap::new(),
+        };
+        let field_filter = FieldFilter::default();
+        let ctx = RenderContext {
+            issue: &issue,
+            downloaded: &[],
+            skipped_attachments: &[],
+            attachments: AttachmentIndex::empty(),
+            field_metadata: &field_metadata,
+            field_filter: &field_filter,
+            child_issues: &[],
+            changelog_summary: None,
+            base_url: "https://example.atlassian.net",
+            domain: "example.atlassian.net",
+        };
+
+        let rendered = custom_fields(&ctx).join("\n");
+        assert!(rendered.contains("Roadmap"), "{}", rendered);
+        assert!(rendered.contains("roadmap-alpha"), "{}", rendered);
+        assert!(!rendered.contains("Idea archived"), "{}", rendered);
     }
 }

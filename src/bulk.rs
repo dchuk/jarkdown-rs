@@ -16,7 +16,9 @@ use log::info;
 
 use crate::error::Result;
 use crate::export::{perform_export_with_options, ExportWorkflowOptions};
+use crate::field_cache::FieldMetadataCache;
 use crate::freshness::{self, ExportPlan, PlanOptions};
+use crate::issue::{archived_value_is_yes, IDEA_ARCHIVED_FIELD};
 use crate::jira_client::{JiraApiClient, ValidationIssue};
 use crate::manifest::{
     default_manifest_path, export_option_fingerprint, normalize_issue_key, relative_artifact_path,
@@ -219,8 +221,21 @@ impl BulkExporter {
         } else {
             None
         };
+        // ADR-0005: observe each issue's JPD archived state during validation,
+        // when the site's "Idea archived" field id is already known from the
+        // field cache (populated by any prior full export — see
+        // `perform_export_with_options`). Deliberately no fetch here:
+        // validation stays metadata-only, and an unresolved id just means the
+        // state goes unobserved this run.
+        let archived_field_id = FieldMetadataCache::new(&self.api_client.domain)
+            .get_field_id_by_name(IDEA_ARCHIVED_FIELD);
+
         let (validation_succeeded, validation) = if self.incremental && !self.force {
-            match self.api_client.validate_issue_keys(issue_keys).await {
+            match self
+                .api_client
+                .validate_issue_keys(issue_keys, archived_field_id.as_deref())
+                .await
+            {
                 Ok(results) => (
                     true,
                     results
@@ -314,6 +329,7 @@ impl BulkExporter {
                                             option_fingerprint: option_fingerprint.as_deref(),
                                             option_fingerprint_without_changelog:
                                                 option_fingerprint_without_changelog.as_deref(),
+                                            archived: validated.archived,
                                         },
                                         &path,
                                     ) {
@@ -482,6 +498,7 @@ impl BulkExporter {
                                 update.artifact_path.clone(),
                                 update.option_fingerprint.as_deref(),
                             );
+                            manifest.set_archived(&update.issue.key, update.issue.archived);
                         }
                         ManifestUpdate::Evicted { issue_key, reason } => {
                             manifest.evict(issue_key, reason.clone());
@@ -512,6 +529,12 @@ impl BulkExporter {
                                 artifact_path,
                                 option_fingerprint.as_deref(),
                             );
+                            // Null/absent field on a re-fetched payload means
+                            // observed-live, not unobserved.
+                            let observed = archived_field_id.as_deref().map(|field_id| {
+                                issue.field(field_id).is_some_and(archived_value_is_yes)
+                            });
+                            manifest.set_archived(&issue.key, observed);
                         }
                         Err(e) => {
                             eprintln!(
