@@ -124,21 +124,43 @@ impl SharedArgs {
     /// Emitting these on stderr prevents a flag from silently no-op'ing (which is
     /// what caused the original misdiagnosis of incremental export). `--manifest`
     /// is intentionally NOT listed: it now persists the manifest on its own.
-    pub fn ineffective_flag_warnings(&self) -> Vec<String> {
+    ///
+    /// `summary_json_support` says whether the invoking command can write a
+    /// run summary at all — `SharedArgs` is command-agnostic, but the single
+    /// `export` command never writes one.
+    pub fn ineffective_flag_warnings(
+        &self,
+        summary_json_support: SummaryJsonSupport,
+    ) -> Vec<String> {
         let mut warnings = Vec::new();
         if self.force && !self.incremental {
             warnings.push(
                 "--force has no effect without --incremental (there is nothing to override); ignoring it".to_string(),
             );
         }
-        if self.summary_json.is_some() && self.hierarchy {
-            warnings.push(
-                "--summary-json is not supported with --hierarchy; no summary will be written"
-                    .to_string(),
-            );
+        if self.summary_json.is_some() {
+            match summary_json_support {
+                SummaryJsonSupport::SingleExport => warnings.push(
+                    "--summary-json is only written by the bulk and query commands; no summary will be written for a single export".to_string(),
+                ),
+                SummaryJsonSupport::BulkOrQuery if self.hierarchy => warnings.push(
+                    "--summary-json is not supported with --hierarchy; no summary will be written"
+                        .to_string(),
+                ),
+                SummaryJsonSupport::BulkOrQuery => {}
+            }
         }
         warnings
     }
+}
+
+/// Whether the invoking command can write a `--summary-json` run summary.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SummaryJsonSupport {
+    /// `bulk` / `query`: summaries are written on the flat path.
+    BulkOrQuery,
+    /// Single `export`: never writes a summary.
+    SingleExport,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -319,7 +341,7 @@ mod tests {
     #[test]
     fn force_without_incremental_is_reported_as_ineffective() {
         let args = SharedArgs::try_parse_from(["x", "--force"]).expect("parse");
-        let warnings = args.ineffective_flag_warnings();
+        let warnings = args.ineffective_flag_warnings(SummaryJsonSupport::BulkOrQuery);
         assert!(
             warnings
                 .iter()
@@ -331,7 +353,9 @@ mod tests {
         let with_incremental =
             SharedArgs::try_parse_from(["x", "--force", "--incremental"]).expect("parse");
         assert!(
-            with_incremental.ineffective_flag_warnings().is_empty(),
+            with_incremental
+                .ineffective_flag_warnings(SummaryJsonSupport::BulkOrQuery)
+                .is_empty(),
             "no warning expected when --incremental is present"
         );
     }
@@ -341,7 +365,7 @@ mod tests {
         let args = SharedArgs::try_parse_from(["x", "--summary-json", "out.json", "--hierarchy"])
             .expect("parse");
         assert!(
-            args.ineffective_flag_warnings()
+            args.ineffective_flag_warnings(SummaryJsonSupport::BulkOrQuery)
                 .iter()
                 .any(|w| w.contains("--summary-json") && w.contains("--hierarchy")),
             "expected a warning that --summary-json is unsupported with --hierarchy"
@@ -349,8 +373,49 @@ mod tests {
 
         let flat = SharedArgs::try_parse_from(["x", "--summary-json", "out.json"]).expect("parse");
         assert!(
-            flat.ineffective_flag_warnings().is_empty(),
+            flat.ineffective_flag_warnings(SummaryJsonSupport::BulkOrQuery)
+                .is_empty(),
             "no warning for --summary-json on the flat path"
+        );
+    }
+
+    /// `--summary-json` on the single `export` command never writes a summary
+    /// (flat or hierarchy) and must say so instead of silently no-op'ing —
+    /// the same principle as the other ineffective-flag warnings (issue #50).
+    #[test]
+    fn summary_json_on_single_export_is_reported_as_ineffective() {
+        let args = SharedArgs::try_parse_from(["x", "--summary-json", "out.json"]).expect("parse");
+        let warnings = args.ineffective_flag_warnings(SummaryJsonSupport::SingleExport);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("--summary-json") && w.contains("export")),
+            "expected a warning that export never writes a summary, got {:?}",
+            warnings
+        );
+
+        // With --hierarchy on export, the single-export message still applies
+        // (one warning, not two).
+        let hierarchy =
+            SharedArgs::try_parse_from(["x", "--summary-json", "out.json", "--hierarchy"])
+                .expect("parse");
+        let warnings = hierarchy.ineffective_flag_warnings(SummaryJsonSupport::SingleExport);
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|w| w.contains("--summary-json"))
+                .count(),
+            1,
+            "expected exactly one --summary-json warning, got {:?}",
+            warnings
+        );
+
+        let without_flag = SharedArgs::try_parse_from(["x"]).expect("parse");
+        assert!(
+            without_flag
+                .ineffective_flag_warnings(SummaryJsonSupport::SingleExport)
+                .is_empty(),
+            "no warning without --summary-json"
         );
     }
 }
