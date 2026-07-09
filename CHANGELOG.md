@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Warm-cache hierarchy skips now log `Skipped hierarchy for KEY (unchanged, N
+  issues)` instead of the misleading `Exported hierarchy ...` (#49).
+- `export --summary-json` now warns that a single export never writes a run
+  summary, instead of silently ignoring the flag (papercut from #50; the
+  hierarchy summary itself remains a deferred feature).
+
 ## 1.8.0 - 2026-06-01
 
 Incremental-export ergonomics for flat `bulk`/`query` (#48).

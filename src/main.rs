@@ -192,8 +192,11 @@ fn print_summary(successes: &[jarkdown::ExportResult], failures: &[jarkdown::Exp
 }
 
 /// Print a stderr warning for each flag that has no effect in this invocation.
-fn warn_ineffective_flags(shared: &jarkdown::cli::SharedArgs) {
-    for warning in shared.ineffective_flag_warnings() {
+fn warn_ineffective_flags(
+    shared: &jarkdown::cli::SharedArgs,
+    summary_json_support: jarkdown::cli::SummaryJsonSupport,
+) {
+    for warning in shared.ineffective_flag_warnings(summary_json_support) {
         eprintln!("Warning: {}", warning);
     }
 }
@@ -232,7 +235,10 @@ fn init_logging(verbose: bool) {
 
 async fn handle_export(args: jarkdown::cli::ExportArgs) {
     init_logging(args.shared.verbose);
-    warn_ineffective_flags(&args.shared);
+    warn_ineffective_flags(
+        &args.shared,
+        jarkdown::cli::SummaryJsonSupport::SingleExport,
+    );
 
     let (domain, email, api_token) = load_credentials();
     let client = match JiraApiClient::new(&domain, &email, &api_token) {
@@ -475,7 +481,7 @@ async fn handle_export(args: jarkdown::cli::ExportArgs) {
 
 async fn handle_bulk(args: jarkdown::cli::BulkArgs) {
     init_logging(args.shared.verbose);
-    warn_ineffective_flags(&args.shared);
+    warn_ineffective_flags(&args.shared, jarkdown::cli::SummaryJsonSupport::BulkOrQuery);
 
     let (domain, email, api_token) = load_credentials();
     let client = match JiraApiClient::new(&domain, &email, &api_token) {
@@ -553,7 +559,7 @@ async fn handle_bulk(args: jarkdown::cli::BulkArgs) {
 
 async fn handle_query(args: jarkdown::cli::QueryArgs) {
     init_logging(args.shared.verbose);
-    warn_ineffective_flags(&args.shared);
+    warn_ineffective_flags(&args.shared, jarkdown::cli::SummaryJsonSupport::BulkOrQuery);
 
     let (domain, email, api_token) = load_credentials();
     let client = match JiraApiClient::new(&domain, &email, &api_token) {
@@ -726,8 +732,11 @@ async fn run_hierarchy_export_with_validation(
         };
         match warm_result {
             Ok(Some(tree)) => {
+                // Warm cache hit: nothing was re-exported, and the message
+                // must say so — "Exported" here misled users into thinking
+                // data was refreshed (issue #49).
                 eprintln!(
-                    "Exported hierarchy for {} ({} issues)",
+                    "Skipped hierarchy for {} (unchanged, {} issues)",
                     issue_key,
                     count_nodes(&tree)
                 );
